@@ -1,0 +1,420 @@
+/**
+ * 章节结算管线入口（settlement 对编排器的唯一门面）。
+ *
+ * 组装完整闭环：
+ *   Validator(L0: runLightCheck + 伏笔对账) → Arbiter(纯函数裁决)
+ *   → 通过则「状态快照 → Reducer(applyStateDelta) → 清快照 → 记账」；
+ *   → 拒绝则「不落账、记账、保留正文（可人工重试）」；
+ *   → 首轮 error 且策略允许 → 自动重观察一次（回调由编排器注入，携带 feedback）再裁决。
+ *
+ * 本模块仅供主进程运行路径使用（由 electron-vite 打包），不直接参与 node --test。
+ */
+import type { DatabaseSync } from 'node:sqlite'
+import { runLightCheck } from '../audit/light-check'
+import {
+  applyStateDelta,
+  summarizeChapterAfterSettlement,
+  type StoryStateContext,
+  type StateDelta
+} from '../../story-state-store'
+import { arbitrateSettlement } from './arbiter'
+import { reconcileForeshadowing } from './foreshadow-reconcile'
+import {
+  hasSettledContent,
+  newSettlementRunId,
+  readSettlementRun,
+  recordSettlementRun,
+  setSettlementRunTrace,
+  settlementContentHash,
+  snapshotSettlementState
+} from './settlement-store'
+import { expireForecastsOlderThan } from '../forecast/store'
+import { CONTEXT_TRACE_ON, buildTraceFromStoryContext, createContextTrace, evaluateContextBudget } from '../context-trace'
+import { acquireBookLock, heartbeatBookLock, releaseBookLock } from '../locking/book-lock'
+import {
+  DEFAULT_SETTLEMENT_POLICY,
+  type ArbiterDecision,
+  type SettlementIssue,
+  type SettlementOutcome,
+  type SettlementPolicy,
+  type SettlementReconcileFn
+} from './types'
+
+/** 自动重观察的最大次数（与生成任务的 agent 步数解耦，避免拖死结算） */
+const MAX_AUTO_REOBSERVE = 1
+
+export interface SettleChapterParams {
+  projectId: string
+  chapterId?: string
+  chapterIndex: number
+  content: string
+  contentHash?: string
+  /** 结算前状态（由调用方基于正文涉及的字符构建） */
+  preState: StoryStateContext
+  /** Observer 产出的增量；null = 未提取到变更 */
+  delta: StateDelta | null
+  policy?: Partial<SettlementPolicy>
+  /**
+   * 自动重观察回调：attempt 从 1 开始，feedback 为上一轮 error 问题摘要。
+   * 返回 null 表示重观察失败。不提供回调时，首轮 error 直接走拒绝。
+   */
+  observe?: (attempt: number, feedback: string) => Promise<{ delta: StateDelta | null } | null>
+  /**
+   * L1(LLM 对账) 回调：对给定 delta 返回对账问题（error/warning/hint）。
+   * 仅在 `policy.enableLLMReconcile` 且 delta 非空时被调用；回调内部应自行兜底，
+   * 失败返回 []（由编排器负责记录 L1 失败告警），这里再做一次保险性捕获。
+   */
+  reconcile?: SettlementReconcileFn
+  /**
+   * supersede 基线：本次结算开始前「某章最近一次结算」的 createdAt。
+   * 若结算进行期间已有更新的记录落账（例如「定稿同步 settlement:sync」先完成），
+   * 本次（如草稿期）结算不再覆盖 → 判 skip。用于防止草稿结算覆盖更新的定稿结算的竞态。
+   */
+  supersedeBaselineCreatedAt?: string
+  /** 触发场景标记（如 'postgen' | 'rerun' | 'sync'），用于 context_traces.run_kind；缺省 'settle' */
+  runKind?: string
+}
+
+/**
+ * 对一章执行完整结算（带 BOOK_BUSY 写锁，P6.1.2）。
+ * 同一 project:chapter 的并发结算会互斥：后到者 acquire 失败抛 BookWriteLockError(BOOK_BUSY)。
+ * 锁只覆盖结算（含 reconcile/observe 的 LLM 回调，通常 <1 个租约）；离开即释放。
+ * 纯确定性部分（Validator/Arbiter/落账/记账/快照）全部收口在 unlocked 实现里。
+ */
+export async function runChapterSettlement(
+  db: DatabaseSync,
+  params: SettleChapterParams
+): Promise<SettlementOutcome> {
+  const scope = `settle:${params.projectId}:${params.chapterIndex}`
+  const owner = params.chapterId ? `chapter:${params.chapterId}` : scope
+  const token = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  acquireBookLock(db, { scope, owner, token })
+
+  // P6.1.3：结算可能跨 reconcile/observe 的 LLM 等待（通常远小于租约，但保守起见）
+  // 定时心跳保活，防止长时间任务期间锁过期被并发任务抢占。
+  const heartbeatInterval = 25_000
+  const heartbeatTimer = setInterval(() => {
+    try {
+      heartbeatBookLock(db, { scope, owner, token })
+    } catch {
+      // 心跳失败不阻断结算；若锁已丢失，由结算本身的幂等/乐观更新兜底
+    }
+  }, heartbeatInterval)
+
+  try {
+    return await runChapterSettlementUnlocked(db, params)
+  } finally {
+    clearInterval(heartbeatTimer)
+    releaseBookLock(db, { scope, owner, token })
+  }
+}
+
+async function runChapterSettlementUnlocked(
+  db: DatabaseSync,
+  params: SettleChapterParams
+): Promise<SettlementOutcome> {
+  const policy: SettlementPolicy = { ...DEFAULT_SETTLEMENT_POLICY, ...params.policy }
+  const contentHash = params.contentHash ?? settlementContentHash(params.content)
+
+  // 幂等守卫：同一正文已结算且不允许重放 → 跳过（不落账）。
+  if (!policy.allowReapply && hasSettledContent(db, params.projectId, params.chapterIndex, contentHash)) {
+    return {
+      status: 'skipped',
+      decision: 'skip',
+      applied: false,
+      issues: [],
+      reason: '相同正文已完成结算，幂等跳过'
+    }
+  }
+
+  // 首次裁决（L0 + 可选 L1 对账）
+  const firstDelta = params.delta
+  const firstPreIssues = await buildCombinedIssues(params, firstDelta, 0)
+  let decision = arbitrateSettlement({
+    projectId: params.projectId,
+    chapterId: params.chapterId,
+    chapterIndex: params.chapterIndex,
+    contentHash,
+    content: params.content,
+    delta: firstDelta,
+    preIssues: firstPreIssues,
+    alreadySettled: false,
+    observeAttempt: 0,
+    policy
+  })
+
+  // 自动重观察：仅当首轮为 retry_observe 且提供回调时执行一次。
+  let attemptsUsed = 1
+  if (decision.type === 'retry_observe') {
+    // 记录中间裁决，保证「拒绝→重试→再裁决」的审计路径可见。
+    recordSettlementRun(db, {
+      projectId: params.projectId,
+      chapterId: params.chapterId,
+      chapterIndex: params.chapterIndex,
+      contentHash,
+      attempt: 0,
+      status: 'rejected',
+      decision: 'retry_observe',
+      issues: decision.issues,
+      delta: firstDelta,
+      reason: decision.reason
+    })
+
+    const feedback = summarizeIssues(decision.issues)
+    const rerun = params.observe
+      ? await params.observe(1, feedback)
+      : null
+
+    if (rerun) {
+      const nextDelta = rerun.delta
+      // 重观察后再次做 L0 + L1 对账（带上一轮 feedback），再裁决。
+      const nextPreIssues = await buildCombinedIssues(params, nextDelta, 1, feedback)
+      decision = arbitrateSettlement({
+        projectId: params.projectId,
+        chapterId: params.chapterId,
+        chapterIndex: params.chapterIndex,
+        contentHash,
+        content: params.content,
+        delta: nextDelta,
+        preIssues: nextPreIssues,
+        alreadySettled: false,
+        observeAttempt: 1,
+        policy
+      })
+      attemptsUsed = 2
+    } else {
+      // 无法重观察 → 维持拒绝。
+      decision = {
+        type: 'reject',
+        status: 'rejected',
+        issues: decision.issues,
+        reason: decision.reason
+      }
+    }
+  }
+
+  // supersede 守卫：apply 前若已有更新的记录落账（如定稿同步先完成）→ 不覆盖（防草稿结算竞态）。
+  if ((decision.type === 'apply' || decision.type === 'apply_with_warning') && params.supersedeBaselineCreatedAt) {
+    const latest = readSettlementRun(db, params.projectId, params.chapterId, params.chapterIndex)
+    if (latest && latest.createdAt && latest.createdAt > params.supersedeBaselineCreatedAt) {
+      decision = {
+        type: 'skip',
+        status: 'skipped',
+        issues: [],
+        reason: '结算进行期间已有更新的记录落账（如定稿同步先完成），本次结算不覆盖（superseded）'
+      }
+    }
+  }
+
+  return finalizeDecision(db, params, contentHash, decision, attemptsUsed, firstDelta)
+}
+
+/**
+ * 组装一轮裁决的 preIssues：L0(规则 light-check + 伏笔对账) + 可选 L1(LLM 对账)。
+ * L1 仅在策略开启且 delta 非空时执行；异常被兜底为 []（不阻断 L0 结论）。
+ */
+async function buildCombinedIssues(
+  params: SettleChapterParams,
+  delta: StateDelta | null,
+  attempt: number,
+  feedback?: string
+): Promise<SettlementIssue[]> {
+  const baseIssues = buildPreIssues(params.preState, params.chapterIndex, params.content, delta)
+  if (!params.policy?.enableLLMReconcile || !delta || !params.reconcile) {
+    return baseIssues
+  }
+  try {
+    const l1Issues = await params.reconcile(attempt, delta, feedback)
+    return [...baseIssues, ...(Array.isArray(l1Issues) ? l1Issues : [])]
+  } catch {
+    // L1 失败不阻断 L0 结论；编排器负责记录 L1 失败告警。
+    return baseIssues
+  }
+}
+
+function finalizeDecision(
+  db: DatabaseSync,
+  params: SettleChapterParams,
+  contentHash: string,
+  decision: ArbiterDecision,
+  attemptsUsed: number,
+  originalDelta: StateDelta | null
+): SettlementOutcome {
+  if (decision.type === 'skip' || decision.type === 'reject') {
+    recordSettlementRun(db, {
+      projectId: params.projectId,
+      chapterId: params.chapterId,
+      chapterIndex: params.chapterIndex,
+      contentHash,
+      attempt: attemptsUsed,
+      status: decision.status,
+      decision: decision.type,
+      issues: decision.issues,
+      delta: originalDelta,
+      reason: decision.reason
+    })
+    return {
+      status: decision.status,
+      decision: decision.type,
+      applied: false,
+      issues: decision.issues,
+      reason: decision.reason
+    }
+  }
+
+  // apply / apply_with_warning：快照 → 落账 → 记账。
+  // 注意：结算成功后**保留**该章快照，供后续按章回滚（rollback IPC）恢复到结算前状态；
+  // 同一章的再次结算会先清旧快照再写新快照；回滚消费后由调用方清理。
+  // P7.2：预生成 runId，使本次结算的「快照 / 状态行(source_event_id) / 账本记录」指向同一事件，
+  // 从而状态行可反查是哪次结算、由谁触发。
+  const scope = scopeFromDelta(originalDelta)
+  const runId = newSettlementRunId()
+  snapshotSettlementState(db, params.projectId, params.chapterIndex, scope, runId)
+
+  try {
+    if (originalDelta) {
+      applyStateDelta(db, params.projectId, params.chapterIndex, originalDelta, {
+        sourceEventId: runId,
+        actor: 'observer'
+      })
+    }
+    recordSettlementRun(db, {
+      id: runId,
+      projectId: params.projectId,
+      chapterId: params.chapterId,
+      chapterIndex: params.chapterIndex,
+      contentHash,
+      attempt: attemptsUsed,
+      status: decision.status,
+      decision: decision.type,
+      issues: decision.issues,
+      delta: originalDelta,
+      reason: decision.reason
+    })
+    // P7.3：落账后确定性生成/覆盖章摘要账（无 LLM；失败不阻断结算）
+    try {
+      summarizeChapterAfterSettlement(db, params.projectId, params.chapterIndex, originalDelta, runId)
+    } catch {
+      // 忽略：摘要失败不影响结算结果
+    }
+    // P7.4/P6.4：结算上下文过程审计落账——记喂了什么 + 分层/token 粗估 + protected 预算评估 + 压缩记录（可回放；失败不阻断）并回填 trace_id
+    if (CONTEXT_TRACE_ON && params.preState) {
+      try {
+        const trace = buildTraceFromStoryContext(params.preState)
+        const budget = evaluateContextBudget(trace.tokens)
+        const traceId = createContextTrace(db, {
+          projectId: params.projectId,
+          chapterIndex: params.chapterIndex,
+          runKind: params.runKind ?? 'settle',
+          sourceEventId: runId,
+          ...trace,
+          budget,
+          compression: {
+            applied: [],
+            reason: budget.overBudget
+              ? `protected 超预算 ${budget.exceededBy} tok（上限 ${budget.budgetLimit}，未压缩——protected 不可降级）`
+              : 'settlement-observer-full-context-no-compression'
+          }
+        })
+        setSettlementRunTrace(db, runId, traceId)
+      } catch {
+        // 忽略：trace 失败不影响结算
+      }
+    }
+    // P6.2.3：正史已推进 → 把 base 更早的 forecast 标记过期（不删除，可审计；失败不阻断结算）
+    try {
+      expireForecastsOlderThan(db, params.projectId, params.chapterIndex)
+    } catch {
+      // 忽略：过期失败不影响结算结果
+    }
+    return {
+      status: decision.status,
+      decision: decision.type,
+      applied: true,
+      issues: decision.issues,
+      reason: decision.reason
+    }
+  } catch (error) {
+    recordSettlementRun(db, {
+      id: runId,
+      projectId: params.projectId,
+      chapterId: params.chapterId,
+      chapterIndex: params.chapterIndex,
+      contentHash,
+      attempt: attemptsUsed,
+      status: 'error',
+      decision: 'reject',
+      issues: [{
+        category: 'state_conflict',
+        severity: 'error',
+        message: `状态落账失败：${error instanceof Error ? error.message : String(error)}`
+      }],
+      delta: originalDelta,
+      reason: 'applyStateDelta 抛出异常，事务已回滚，快照保留可回滚'
+    })
+    return {
+      status: 'error',
+      decision: 'reject',
+      applied: false,
+      issues: [{
+        category: 'state_conflict',
+        severity: 'error',
+        message: `状态落账失败：${error instanceof Error ? error.message : String(error)}`
+      }],
+      reason: '状态落账失败'
+    }
+  }
+}
+
+/** Validator(L0) 汇总：light-check 规则 + 伏笔账本↔delta 对账。 */
+function buildPreIssues(
+  preState: StoryStateContext,
+  chapterIndex: number,
+  content: string,
+  delta: StateDelta | null
+): SettlementIssue[] {
+  const issues: SettlementIssue[] = []
+  if (delta) {
+    const check = runLightCheck(content, preState, delta)
+    for (const violation of check.violations) {
+      issues.push({
+        category: violation.type as SettlementIssue['category'],
+        severity: violation.severity,
+        message: violation.message
+      })
+    }
+    issues.push(...reconcileForeshadowing({
+      activeForeshadowing: preState.activeForeshadowing,
+      chapterIndex,
+      delta
+    }))
+  }
+  return issues
+}
+
+/** 从 delta 收集需要快照/回滚的实体 id。 */
+function scopeFromDelta(delta: StateDelta | null): {
+  characterIds: string[]
+  foreshadowingIds: string[]
+  relationshipIds: string[]
+} {
+  if (!delta) return { characterIds: [], foreshadowingIds: [], relationshipIds: [] }
+  const foreshadowing = delta.foreshadowing_delta ?? { planted: [], advanced: [], resolved: [] }
+  const foreshadowingIds = [
+    ...(foreshadowing.planted ?? []).map((p) => p.id),
+    ...(foreshadowing.advanced ?? []).map((a) => a.id),
+    ...(foreshadowing.resolved ?? []).map((r) => r.id)
+  ]
+  return {
+    characterIds: delta.characters_updated.map((c) => c.character_id),
+    foreshadowingIds,
+    relationshipIds: delta.relationships_delta.map((r) => r.relationship_id)
+  }
+}
+
+function summarizeIssues(issues: SettlementIssue[]): string {
+  return issues
+    .slice(0, 5)
+    .map((i) => `[${i.severity}] ${i.message}`)
+    .join('\n')
+}

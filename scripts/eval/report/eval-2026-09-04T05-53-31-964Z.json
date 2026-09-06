@@ -1,0 +1,149 @@
+{
+  "generatedAt": "2026-09-04T05:53:31.963Z",
+  "mode": "gate",
+  "metrics": {
+    "settlementSuccessRate": 0.763,
+    "attemptedChapters": 173,
+    "settledChapters": 132,
+    "rejectedChapters": 41,
+    "skippedChapters": 42,
+    "contradictionSuspectRate": 0.237,
+    "contradictionSuspect": 41,
+    "hardContradictionPrevented": 41,
+    "observerProvided": 4,
+    "observerFailures": 1,
+    "observerRecoveryRate": 0.75,
+    "foreshadowRecoveryRate": 0.6667,
+    "foreshadowPlanned": 3,
+    "foreshadowRecovered": 2
+  },
+  "scenarios": [
+    {
+      "id": "S1-happy-path",
+      "name": "连续 3 章正常推进",
+      "chapters": 3,
+      "attempted": 3,
+      "settled": 3,
+      "rejected": 0,
+      "skipped": 0,
+      "contradictionSuspect": 0,
+      "hardContradictionPrevented": 0,
+      "observerProvided": 0,
+      "observerFailures": 0,
+      "foreshadowing": {
+        "planned": null,
+        "recovered": null
+      },
+      "failures": []
+    },
+    {
+      "id": "S2-foreshadow-recovery",
+      "name": "伏笔按计划埋设与回收（回收率 2/3）",
+      "chapters": 3,
+      "attempted": 3,
+      "settled": 3,
+      "rejected": 0,
+      "skipped": 0,
+      "contradictionSuspect": 0,
+      "hardContradictionPrevented": 0,
+      "observerProvided": 0,
+      "observerFailures": 0,
+      "foreshadowing": {
+        "planned": 3,
+        "recovered": 2
+      },
+      "failures": []
+    },
+    {
+      "id": "S3-reject-on-hard-contradiction",
+      "name": "L1 注入硬矛盾 → 拒绝落盘，状态不写入",
+      "chapters": 2,
+      "attempted": 2,
+      "settled": 1,
+      "rejected": 1,
+      "skipped": 0,
+      "contradictionSuspect": 1,
+      "hardContradictionPrevented": 1,
+      "observerProvided": 0,
+      "observerFailures": 0,
+      "foreshadowing": {
+        "planned": null,
+        "recovered": null
+      },
+      "failures": []
+    },
+    {
+      "id": "S4-auto-reobserve-recovers",
+      "name": "首轮 error → 自动重观察修正 → 结算成功",
+      "chapters": 2,
+      "attempted": 2,
+      "settled": 2,
+      "rejected": 0,
+      "skipped": 0,
+      "contradictionSuspect": 0,
+      "hardContradictionPrevented": 0,
+      "observerProvided": 0,
+      "observerFailures": 0,
+      "foreshadowing": {
+        "planned": null,
+        "recovered": null
+      },
+      "failures": []
+    },
+    {
+      "id": "S5-no-state-change-skipped",
+      "name": "无状态变更 → skip（不落账）",
+      "chapters": 1,
+      "attempted": 0,
+      "settled": 0,
+      "rejected": 0,
+      "skipped": 1,
+      "contradictionSuspect": 0,
+      "hardContradictionPrevented": 0,
+      "observerProvided": 0,
+      "observerFailures": 0,
+      "foreshadowing": {
+        "planned": null,
+        "recovered": null
+      },
+      "failures": []
+    },
+    {
+      "id": "S6-observer-fault",
+      "name": "Observer 输出故障注入（真实 extractJsonObject/normalize 路径）",
+      "chapters": 4,
+      "attempted": 3,
+      "settled": 3,
+      "rejected": 0,
+      "skipped": 1,
+      "contradictionSuspect": 0,
+      "hardContradictionPrevented": 0,
+      "observerProvided": 4,
+      "observerFailures": 1,
+      "foreshadowing": {
+        "planned": null,
+        "recovered": null
+      },
+      "failures": []
+    },
+    {
+      "id": "GEN-200-chapters",
+      "name": "生成式 200 章混合语料",
+      "chapters": 200,
+      "attempted": 160,
+      "settled": 120,
+      "rejected": 40,
+      "skipped": 40,
+      "contradictionSuspect": 40,
+      "hardContradictionPrevented": 40,
+      "observerProvided": 0,
+      "observerFailures": 0,
+      "foreshadowing": {
+        "planned": null,
+        "recovered": null
+      },
+      "failures": []
+    }
+  ],
+  "failures": []
+}

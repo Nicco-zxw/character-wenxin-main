@@ -1,0 +1,15 @@
+{
+  "settlementSuccessRate": 0.763,
+  "attemptedChapters": 173,
+  "settledChapters": 132,
+  "rejectedChapters": 41,
+  "skippedChapters": 42,
+  "contradictionSuspectRate": 0.237,
+  "hardContradictionPrevented": 41,
+  "observerProvided": 4,
+  "observerFailures": 1,
+  "observerRecoveryRate": 0.75,
+  "foreshadowRecoveryRate": 0.6667,
+  "foreshadowPlanned": 3,
+  "foreshadowRecovered": 2
+}

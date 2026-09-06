@@ -1,0 +1,7 @@
+{
+  "comment": "复制为 llm-settings.json 并填入你的真实 OpenAI 兼容端点（本文件不入库）。baseUrl 需含 /v1 前缀（如 https://api.deepseek.com/v1）。",
+  "baseUrl": "https://api.deepseek.com/v1",
+  "apiKey": "sk-d2b164177b494ee682bccac84932ba02",
+  "model": "deepseek-chat",
+  "maxTokens": 2500
+}

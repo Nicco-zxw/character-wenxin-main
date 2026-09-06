@@ -1,0 +1,343 @@
+import type { AiAgentStreamHandlers, AiKnowledgeDocumentDraft, AiTaskKnowledgeContext, AiTaskPayload, AiTaskResponse } from '../shared-types'
+import { normalizeSettings, validateSettings, resolveMaxTokens, shouldOmitMaxTokens } from '../settings'
+import { getTaskHandler } from '../tasks'
+import { resolveTaskSkills, getSkillById, getAllSkills } from '../skills'
+import { isSkillEnabledForTask } from '../skills/task-selection'
+import { buildPromptInput } from '../runtime/context-builder'
+import { enrichTaskContextForGeneration } from '../runtime/task-context'
+import { buildRunMeta, buildResponsePreview } from '../runtime/run-meta'
+import { logPrompt, logResponse, logError, logSelection } from '../runtime/logging'
+import { runAgent } from './run-agent'
+import { createSkillTools } from './tools/skill-tools'
+import { createKnowledgeTools } from './tools/knowledge-tools'
+import { createChapterTools } from './tools/chapter-tools'
+import { createProjectDataTools } from './tools/project-data-tools'
+import { createSettingProposalTools, createEmptySettingProposalDraft, settingProposalHasContent } from './tools/setting-proposal-tools'
+import { buildAgentBehaviorRules, buildSkillIndex } from './system-prompt'
+import { getRecentSkillUsage, formatSkillUsageHint, recordSkillUsage } from './skill-usage-memory'
+import { readFileSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { formatAiErrorMessage } from '../error-message'
+
+/** 去掉 SKILL.md 开头的 YAML frontmatter 块（--- ... ---）。 */
+function stripSkillFrontmatter(content: string): string {
+  const match = content.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/)
+  if (!match) return content
+  return content.slice(match[0].length)
+}
+
+function resolveStreamingAgentMaxSteps(taskName: AiTaskPayload['task']): number | undefined {
+  if (taskName === 'chapter-first-draft') {
+    // skills 已直接注入 prompt，无需工具加载；仅保留少量步数用于偶尔确认设定
+    return 4
+  }
+
+  if (taskName === 'chapter-assistant') {
+    // 创作助理：预留足够步数用于工具调用 + 最终文本回复
+    // 典型流程：读取章节(1) + 读取项目数据(1-3) + 多轮推理(2-4) + 最终回复(1)
+    // 设置为 20 确保复杂任务有足够余量
+    return 20
+  }
+
+  if (taskName === 'global-assistant') {
+    return 12
+  }
+
+  return undefined
+}
+
+/**
+ * 流式 Agent 模式的 AI 任务入口。与 runAgentTask 类似，但通过 handlers 回调
+ * 实时推送文本增量、工具调用状态和编辑事件，适用于前端需要流式渲染的场景。
+ *
+ * @param task - AI 任务载荷
+ * @param handlers - 流式回调处理器（文本增量、工具状态、编辑应用等）
+ * @param signal - 中止信号，支持前端取消请求
+ * @param knowledgeContext - 可选的知识库上下文
+ * @returns 任务结果，包含标准化输出和运行元数据
+ */
+export async function runStreamingAgentTask(
+  task: AiTaskPayload,
+  handlers: AiAgentStreamHandlers,
+  signal: AbortSignal,
+  knowledgeContext?: AiTaskKnowledgeContext
+): Promise<AiTaskResponse> {
+  const settings = normalizeSettings(task.settings)
+  validateSettings(settings)
+  const startedAt = new Date().toISOString()
+  const chapterId = String(task.context.chapterId ?? '').trim() || undefined
+
+  const handler = getTaskHandler(task.task)
+  const { projectId, skills: candidateSkills, usedSkillIds } = await resolveTaskSkills(task)
+  logSelection(task.task, candidateSkills, knowledgeContext?.usedKnowledge ?? [])
+  await enrichTaskContextForGeneration(task, settings)
+
+  const input = buildPromptInput(task, candidateSkills, knowledgeContext)
+  if (task.task === 'chapter-first-draft') {
+    input.skillsBlock = '（skills 已通过工具按需加载，参见 system prompt 中的索引）'
+  }
+  const prompt = handler.buildPrompt(input)
+  const baseMaxTokens = handler.resolveMaxTokens?.(input) ?? resolveMaxTokens(task) ?? 4096
+  // 推理模型（如 mimo、deepseek-r1、gpt-5 系列）的 reasoning tokens 也计入 maxOutputTokens，
+  // 与可见输出共享同一预算；4096 的下限会被推理 token 吃光，导致 finish_reason=length、可见输出为 0。
+  // 初稿任务按 3 倍放大确保正文可以完整输出，并对所有 Agent 路径抬高下限留足空间。
+  const AGENT_MIN_OUTPUT_TOKENS = 16000
+  const reasoningMultiplier = task.task === 'chapter-first-draft' ? 3 : 1
+  const maxTokens = shouldOmitMaxTokens(task.task)
+    ? undefined
+    : Math.max(baseMaxTokens * reasoningMultiplier, AGENT_MIN_OUTPUT_TOKENS)
+
+  const candidateSkillDefs = candidateSkills
+    .map((sel) => getSkillById(sel.id, projectId || undefined))
+    .filter((s): s is NonNullable<typeof s> => Boolean(s))
+
+  const requiredSkillDefs = candidateSkillDefs.filter((s) => s.manifest.required)
+  const optionalSkillDefs = candidateSkillDefs.filter((s) => !s.manifest.required)
+  const maxSteps = resolveStreamingAgentMaxSteps(task.task)
+
+  const requiredSkillBlock = requiredSkillDefs.length
+    ? `\n\n## 强制生效的 SKILLS\n\n${requiredSkillDefs.map((s) => {
+        const body = stripSkillFrontmatter(s.content).trim().slice(0, 2000)
+        return `### ${s.name}\n${body}`
+      }).join('\n\n')}`
+    : ''
+
+  // 章节初稿：所有可选 skill 的核心参考文件直接注入 prompt，不再依赖 agent 工具调用
+  let preloadedSkillRefsBlock = ''
+  if (task.task === 'chapter-first-draft' && optionalSkillDefs.length > 0) {
+    const refParts: string[] = []
+    for (const s of optionalSkillDefs) {
+      const body = stripSkillFrontmatter(s.content).trim().slice(0, 1500)
+      if (body) {
+        refParts.push(`### ${s.name}\n${body}`)
+      }
+      if (s.referenceFiles.length === 0) continue
+      const firstRef = s.referenceFiles[0]
+      const refPath = join(s.rootDir, firstRef)
+      try {
+        if (!existsSync(refPath)) continue
+        const refContent = readFileSync(refPath, 'utf-8').slice(0, 2500)
+        refParts.push(`### ${s.name} — ${firstRef}\n${refContent}`)
+      } catch {
+        // skip
+      }
+    }
+    if (refParts.length > 0) {
+      preloadedSkillRefsBlock = `\n\n## 写作技法参考（已全部注入，无需工具加载）\n\n${refParts.join('\n\n')}`
+    }
+  }
+
+  const skillUsageHints = task.task === 'chapter-first-draft'
+    ? await getRecentSkillUsage(projectId).then(formatSkillUsageHint).catch(() => '')
+    : ''
+
+  const enabledModules: string[] = Array.isArray(task.context.enabledContextModules) ? task.context.enabledContextModules : []
+  const moduleLabels: Record<string, string> = {
+    chapter: '当前章节正文（使用 read_chapter）',
+    outline: '章节大纲（使用 read_project_data entity_type=outline）',
+    characters: '角色设定卡（使用 read_project_data entity_type=characters）',
+    worldview: '世界观设定（使用 read_project_data entity_type=worldview）',
+    organizations: '组织设定（使用 read_project_data entity_type=organizations）',
+    relationships: '角色关系（使用 read_project_data entity_type=relationships）',
+    plotThreads: '剧情线索（使用 read_project_data entity_type=plot_threads）',
+    inspiration: '灵感记录（使用 read_project_data entity_type=inspiration）',
+    knowledge: '项目知识库（使用 read_project_data entity_type=knowledge）',
+    deconstructionLibrary: '公共拆书知识库/参考书（使用 read_project_data entity_type=available_deconstructions 或 deconstruction_library）',
+    workflowDocuments: '创作记忆（使用 read_project_data entity_type=workflow_documents）',
+    projectConstraints: '项目约束（使用 read_project_data entity_type=project_constraints）'
+  }
+  const enabledModulesList = enabledModules
+    .filter((m) => moduleLabels[m])
+    .map((m) => `- ${moduleLabels[m]}`)
+    .join('\n')
+
+  const contextModulesBlock = enabledModulesList
+    ? [
+        '',
+        '## 用户已启用的上下文模块',
+        '',
+        '以下模块已启用，你可以按需通过工具读取：',
+        enabledModulesList,
+        '',
+        '根据用户的具体请求，自行判断需要读取哪些模块。不必每次都全部读取，只读取与当前任务相关的即可。'
+      ].join('\n')
+    : ''
+
+  const globalAssistantRules = task.task === 'global-assistant' || task.task === 'global-assistant-proposal'
+    ? [
+        '',
+        '## Global Assistant Agent Rules',
+        '',
+        '- Decide which project modules to inspect before answering. Do not rely only on short summaries when the request depends on concrete project facts.',
+        '- Prefer `read_project_data` without `entity_type` to get a quick index, then read only the modules that matter.',
+        '- Use narrow reads whenever possible: `summary_only=true` for reconnaissance, `limit` to avoid over-reading, `entity_id` for exact entities, and `doc_key` for creative memory.',
+        '- When the user asks what skills exist, what skills are enabled, or asks to summarize every skill, you must call `skill_list` first and answer from its result. The skill index above is only the current task-matched subset, not the complete registry.',
+        '- When the user asks for 拆书知识库 / 可用拆书 / 参考书 / 对标作品 / reference works, call `read_project_data` with `entity_type=available_deconstructions`; the deconstruction library is public and shared across projects, not owned by the current project.',
+        '- Do not rely on the static skill list alone. When the task may benefit from project skills, you must decide which skills are relevant and explicitly call `skill_load` yourself before concluding.',
+        '- Use `search_project` first when the user mentions a specific concept, role, event, clue, creative memory artifact, or rule and you are not sure where it lives.',
+        '- Treat `project_constraints` as hard boundaries and `workflow_documents` as creative memory. If they may affect the answer, inspect them before concluding.',
+        '- Prefer targeted reads over loading every module. Read just enough context to answer well.',
+        '- After using tools, produce a direct answer for the user instead of stopping at notes or partial findings.'
+      ].join('\n')
+    : ''
+
+  const settingProposalRules = task.task === 'global-assistant'
+    ? [
+        '',
+        '## 结构化写回提案规则',
+        '',
+        '- 你有 `propose_constraint` / `propose_worldview` / `propose_character` / `propose_outline` 四个工具，可把讨论中确立的设定提议写入「项目约束 / 世界观设定 / 角色图鉴 / 大纲剧情」。',
+        '- 这些工具只产出**提案**，用户会在 Diff 审阅弹窗里逐条确认后才真正写入，你无需担心改坏数据，但也不要滥用。',
+        '- 仅当用户明确表达录入 / 确立 / 纠正 / 沉淀设定的意图，或讨论已收敛出具体、可落库的设定时才调用；纯问答、头脑风暴、还在发散讨论时不要调用。',
+        '- 要修改已有条目时，先用 `read_project_data` 或 `search_project` 取到精确的标题 / 姓名，再填入 `match_title` / `match_name`；匹配不准就不要瞎填（否则用户侧无法写回），改用自然语言说明需人工确认。',
+        '- 一个独立设定调用一次对应工具，不要为凑数刷工具，同一条不要重复提交。',
+        '- 调用提案工具后，仍要给用户一段正常的自然语言回复，说明你提议了哪些改动。'
+      ].join('\n')
+    : ''
+
+  const chapterToolRules = task.task === 'chapter-assistant' || task.task === 'chapter-first-draft'
+    ? [
+        '- 每次处理用户请求时，先完成意图判读，再选择工具：chat=普通问答/讨论，diagnose=诊断/建议，chapter_edit_proposal=生成正文修改提案，apply_previous_suggestion=按上一轮建议生成正文修改提案。不要跳过这一步直接罗列清单。',
+        '- 如果 prompt 中出现“意图判读提示”，它只是前端根据输入模式和选区给出的初步判断；你必须结合用户原话复核。若提示与用户原话冲突，以用户原话为准。',
+        '- 当意图是 chapter_edit_proposal 或 apply_previous_suggestion 时，必须调用 `edit_chapter` 生成待审查 Diff 提案；不要只输出建议列表、操作清单或泛泛原则。',
+        '- 当意图是 diagnose 时，可以读取正文并给出“问题 -> 证据 -> 最小修法”，但不要调用 `edit_chapter`，除非用户同时明确说要你直接改。',
+        '- 当意图是 chat 时，按问答处理，不要写回正文。',
+        '- 每次对话开始时，先用 `read_chapter` 读取当前章节内容，了解正文现状。',
+        '- 涉及创作、改写、续写时，先用 `read_project_data` 或 `search_project` 读取相关设定，优先小范围读取，确保内容一致性。',
+        '- 当你不确定资料在哪个模块时，先用 `search_project`；当你只需要目录或概览时，先用 `read_project_data({ summary_only: true, limit: ... })`。',
+        '- 知识文档、创作记忆、项目约束都可能影响创作判断；如果请求涉及风格、计划、进度、边界、硬性规则，应主动检查这些模块。',
+        '- 【重要】当用户给出明确修改方向并要求执行时（如"删掉拖沓段落并改写"、"润色文章开头"、"润色当前章节开篇"、"按建议改"、"应用到正文"等），你必须使用 `edit_chapter` 工具生成正文修改提案，而不是只输出建议文本或润色后的正文。',
+        '- 如果用户只说“我需要修改小说第一章内容 / 修改某章内容 / 改第一章 / 调整当前章节”，但没有说明修改目标、风格或问题点，先读取目标章节并给出简短诊断/可选修改方向，或询问用户想改什么；不要直接生成 Diff 提案。',
+        '- 修改前先用 `read_chapter` 读取当前内容，确认要修改的位置，然后用 `edit_chapter` 生成修改提案。',
+        '- 当前启用 Diff 审阅：`edit_chapter` 只会生成待审查提案，不会立刻写回正文。工具返回“待审查提案”时，最终回复必须明确告诉用户“已生成修改提案，请在 Diff 审阅中确认写回”，不要说“已修复 / 已完成 / 已写入正文”。只有工具结果明确包含 Snapshot version saved，才可以说修改已写入。',
+        '- 如果用户的意图不明确（比如只是问"怎么改比较好"），可以先给建议；但一旦用户确认或要求执行，立即使用工具生成修改提案。'
+      ]
+    : [
+        '- 只有在用户明确提到某一章、当前章节，或任务确实依赖章节正文时，才使用 `read_chapter`。',
+        '- 如果用户要求修改、改写、润色、扩写某一章或当前章节正文（例如“修改第一章内容”“改第 1 章”“润色当前章节”），不要要求用户粘贴正文；必须先用项目内工具定位并读取章节。',
+        '- 用户通常不知道章节 ID。你要自行分析用户说的是哪一章；可以先调用 `list_chapters` 查看章节列表，也可以直接把“第一章 / 第 1 章 / 1 / 章节标题”作为 `chapter_id` 传给 `read_chapter` 或 `edit_chapter`，工具会解析自然语言章节引用。',
+        '- 如果没有活动章节，就不要盲目调用 `read_chapter`；先用 `list_chapters`、`search_project` 或 `read_project_data` 找到目标章节或改读别的项目资料。',
+        '- 只有在用户明确要求修改章节正文、给出具体修改方向，且已有活动章节或可从自然语言判断章节目标时，才使用 `edit_chapter` 生成待审查修改提案；不要向用户索要章节 ID。',
+        '- 如果用户只说“我需要修改小说第一章内容 / 修改第一章内容 / 改第 1 章 / 调整当前章节”这类模糊请求，但没有说明修改方向，读取章节后先给出简短诊断/可选修改方向，或询问用户想怎么改；不要因为用户没粘贴正文就拒绝读取项目内章节，也不要直接生成 Diff 提案。',
+        '- 当前启用 Diff 审阅：`edit_chapter` 只会生成待审查提案，不会立刻写回正文。工具返回“待审查提案”时，最终回复必须明确告诉用户“已生成修改提案，请在 Diff 审阅中确认写回”，不要说“已修复 / 已完成 / 已写入正文”。只有工具结果明确包含 Snapshot version saved，才可以说修改已写入。',
+        '- 当你不确定资料在哪个模块时，先用 `search_project`；当你只需要目录或概览时，先用 `read_project_data({ summary_only: true, limit: ... })`。',
+        '- 知识文档、创作记忆、项目约束都可能影响判断；如果请求涉及风格、计划、进度、边界、硬性规则，应主动检查这些模块。'
+      ]
+
+  const chapterToolsBlock = [
+    '',
+    '## 可用工具',
+    '',
+    '你可以使用以下工具访问项目数据和操作章节：',
+    '- `read_project_data`: 读取项目设定与资料，支持先取索引，再按 `entity_id` / `summary_only` / `limit` / `doc_key` 精读世界观、角色、组织、组织成员、关系、大纲、章节、剧情线索、灵感、项目知识、公共拆书库、参考书、创作记忆、项目约束',
+    '- `read_chapter`: 读取章节内容和元数据；`chapter_id` 支持真实 ID、章节标题、序号和“第一章 / 第1章”等自然语言引用',
+    '- `edit_chapter`: 生成待审查的章节正文修改提案（替换/插入/追加），`chapter_id` 支持真实 ID、章节标题、序号和自然语言引用；用户确认后才会写回正文',
+    '- `search_project`: 搜索项目中的世界观、角色、组织、组织成员、关系、大纲、章节、剧情线索、灵感、项目知识、公共拆书库、参考书、创作记忆、项目约束等资料，并返回 `entity_type` / `entity_id`',
+    '- `list_chapters`: 获取所有章节列表',
+    '',
+    '## 工具使用规则',
+    '',
+    ...chapterToolRules
+  ].join('\n')
+
+  const chapterDraftRules = task.task === 'chapter-first-draft'
+    ? [
+        '',
+        '## 章节初稿 Agent 行为约束',
+        '',
+        '- 你的主要任务是生成完整章节正文。所有写作技法参考已直接注入上方，无需再使用工具加载 skill。',
+        '- 直接开始写正文。写作过程中如遇到不确定的设定，可以用 read_project_data 确认，但尽量减少工具调用。',
+        '- 最终输出必须是纯正文，不要包含任何工具调用的痕迹或解释。'
+      ].join('\n')
+    : ''
+
+  const skillIndexBlock = task.task === 'chapter-first-draft' ? '' : buildSkillIndex(optionalSkillDefs)
+  const systemPrompt = `${prompt.system}${requiredSkillBlock}${preloadedSkillRefsBlock}${chapterToolsBlock}${contextModulesBlock}\n${skillIndexBlock}\n${buildAgentBehaviorRules()}${globalAssistantRules}${settingProposalRules}${chapterDraftRules}${skillUsageHints}`
+
+  const skillTools = createSkillTools({
+    resolveSkill: (id) => getSkillById(id, projectId || undefined),
+    listSkills: () => getAllSkills(projectId || undefined),
+    resolveSkillEnabled: (skill) => isSkillEnabledForTask(task, skill.id, projectId),
+    allowScriptExecution: (skill) => skill.scope === 'builtin'
+  })
+
+  const producedKnowledgeDocuments: AiKnowledgeDocumentDraft[] = []
+  const knowledgeTools = createKnowledgeTools({
+    collectDocument: (doc) => {
+      producedKnowledgeDocuments.push(doc)
+    },
+    defaultSourceLabel: String(task.context.chapterTitle ?? 'agent')
+  })
+
+  const chapterTools = createChapterTools({
+    currentChapterId: chapterId || '',
+    useDiffReview: true,
+    originalUserPrompt: String(task.context.originalUserPrompt ?? task.context.userPrompt ?? ''),
+    blockVagueChapterEdit: task.task === 'global-assistant',
+    onEditApplied: handlers.onEditApplied,
+    onEditProposed: handlers.onEditProposed
+  })
+
+  const projectDataTools = createProjectDataTools()
+
+  // 仅全局助手注册结构化写回提案工具（global-assistant-proposal 走非 agent 的单次 JSON 任务，不经此路径）。
+  const settingProposalDraft = createEmptySettingProposalDraft()
+  const settingProposalTools = task.task === 'global-assistant'
+    ? createSettingProposalTools({ draft: settingProposalDraft })
+    : []
+
+  const registry = [...skillTools, ...knowledgeTools, ...chapterTools, ...projectDataTools, ...settingProposalTools]
+
+  logPrompt('AGENT_STREAM', settings, { system: systemPrompt, user: prompt.user }, task.task, usedSkillIds)
+  const requestStartedAt = Date.now()
+
+  try {
+    const loopResult = await runAgent({
+      settings,
+      systemPrompt,
+      userPrompt: prompt.user,
+      tools: registry,
+      ctx: { signal, projectId },
+      handlers,
+      maxTokens,
+      maxSteps,
+      disableTools: task.task === 'chapter-first-draft'
+    })
+
+    logResponse('AGENT_STREAM', settings, task.task, loopResult.finalText, Date.now() - requestStartedAt, { usedSkills: usedSkillIds })
+
+    const result = handler.normalize(loopResult.finalText, task.context)
+    const finishedAt = new Date().toISOString()
+    const meta = buildRunMeta(
+      task.task, projectId, chapterId, settings, 'success',
+      startedAt, finishedAt,
+      loopResult.usage,
+      knowledgeContext?.usedKnowledge ?? [], usedSkillIds,
+      false, buildResponsePreview(result), ''
+    )
+    meta.toolCalls = loopResult.toolCalls
+    meta.agentIterations = loopResult.iterations
+    if (producedKnowledgeDocuments.length > 0) {
+      meta.producedKnowledgeDocuments = producedKnowledgeDocuments
+    }
+    if (task.task === 'global-assistant' && settingProposalHasContent(settingProposalDraft)) {
+      meta.producedSettingProposal = settingProposalDraft
+    }
+
+    void recordSkillUsage(projectId, task.task, loopResult.toolCalls).catch(() => {})
+
+    return { result, meta }
+  } catch (error) {
+    const finishedAt = new Date().toISOString()
+    const message = formatAiErrorMessage(error, 'AI Agent 调用失败')
+    logError('AGENT_STREAM', settings, task.task, error, Date.now() - requestStartedAt, { usedSkills: usedSkillIds })
+    const meta = buildRunMeta(
+      task.task, projectId, chapterId, settings, 'error',
+      startedAt, finishedAt,
+      undefined,
+      knowledgeContext?.usedKnowledge ?? [], usedSkillIds,
+      false, '', message
+    )
+    throw Object.assign(new Error(message), { aiRunMeta: meta })
+  }
+}

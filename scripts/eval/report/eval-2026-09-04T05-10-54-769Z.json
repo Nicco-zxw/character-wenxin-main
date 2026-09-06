@@ -1,0 +1,98 @@
+{
+  "generatedAt": "2026-09-04T05:10:54.767Z",
+  "metrics": {
+    "settlementSuccessRate": 0.9,
+    "attemptedChapters": 10,
+    "settledChapters": 9,
+    "rejectedChapters": 1,
+    "skippedChapters": 1,
+    "contradictionSuspectRate": 0.1,
+    "hardContradictionPrevented": 1,
+    "foreshadowRecoveryRate": 0.6667,
+    "foreshadowPlanned": 3,
+    "foreshadowRecovered": 2
+  },
+  "scenarios": [
+    {
+      "id": "S1-happy-path",
+      "name": "连续 3 章正常推进",
+      "chapters": 3,
+      "attempted": 3,
+      "settled": 3,
+      "rejected": 0,
+      "skipped": 0,
+      "contradictionSuspect": 0,
+      "hardContradictionPrevented": 0,
+      "foreshadowing": {
+        "planned": null,
+        "recovered": null
+      },
+      "failures": []
+    },
+    {
+      "id": "S2-foreshadow-recovery",
+      "name": "伏笔按计划埋设与回收（回收率 2/3）",
+      "chapters": 3,
+      "attempted": 3,
+      "settled": 3,
+      "rejected": 0,
+      "skipped": 0,
+      "contradictionSuspect": 0,
+      "hardContradictionPrevented": 0,
+      "foreshadowing": {
+        "planned": 3,
+        "recovered": 2
+      },
+      "failures": []
+    },
+    {
+      "id": "S3-reject-on-hard-contradiction",
+      "name": "L1 注入硬矛盾 → 拒绝落盘，状态不写入",
+      "chapters": 2,
+      "attempted": 2,
+      "settled": 1,
+      "rejected": 1,
+      "skipped": 0,
+      "contradictionSuspect": 1,
+      "hardContradictionPrevented": 1,
+      "foreshadowing": {
+        "planned": null,
+        "recovered": null
+      },
+      "failures": []
+    },
+    {
+      "id": "S4-auto-reobserve-recovers",
+      "name": "首轮 error → 自动重观察修正 → 结算成功",
+      "chapters": 2,
+      "attempted": 2,
+      "settled": 2,
+      "rejected": 0,
+      "skipped": 0,
+      "contradictionSuspect": 0,
+      "hardContradictionPrevented": 0,
+      "foreshadowing": {
+        "planned": null,
+        "recovered": null
+      },
+      "failures": []
+    },
+    {
+      "id": "S5-no-state-change-skipped",
+      "name": "无状态变更 → skip（不落账）",
+      "chapters": 1,
+      "attempted": 0,
+      "settled": 0,
+      "rejected": 0,
+      "skipped": 1,
+      "contradictionSuspect": 0,
+      "hardContradictionPrevented": 0,
+      "foreshadowing": {
+        "planned": null,
+        "recovered": null
+      },
+      "failures": []
+    }
+  ],
+  "failures": []
+}

@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "module": "ESNext",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "skipLibCheck": true,
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": false,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "strict": true,
+    "jsx": "preserve",
+    "ignoreDeprecations": "5.0",
+    "types": ["node", "electron"],
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["renderer/src/*"],
+      "@shared/*": ["electron/shared/*"]
+    }
+  },
+  "include": [
+    "electron/**/*.ts",
+    "renderer/**/*.ts",
+    "renderer/**/*.d.ts",
+    "renderer/**/*.tsx",
+    "renderer/**/*.vue",
+    "electron.vite.config.ts"
+  ]
+}
