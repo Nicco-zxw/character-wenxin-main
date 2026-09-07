@@ -4,6 +4,7 @@ import test from 'node:test'
 
 import {
   applyStateDelta,
+  applyStateDeltaInTransaction,
   bumpProjectLedger,
   buildTruthProjectionMarkdown,
   getCharacterStateAtChapter,
@@ -100,6 +101,21 @@ test('同一章节状态增量重复写入不会重复累积数组字段', () =>
   assert.deepEqual(JSON.parse(character.goals_json), ['找到证人'])
   assert.deepEqual(JSON.parse(relationship.tension_points_json), ['互不信任'])
   assert.deepEqual(JSON.parse(foreshadowing.clues_json), [{ chapter: 3, clue: '火漆印', method: '特写' }])
+})
+
+test('Reducer 核心可嵌入外层事务并由外层回滚', () => {
+  const db = new DatabaseSync(':memory:')
+  initStoryStateSchema(db)
+  const delta = normalizeStateDelta({
+    characters_updated: [{ character_id: '林岚', changes: { mental_state: '警觉' } }]
+  })
+
+  db.exec('BEGIN IMMEDIATE')
+  applyStateDeltaInTransaction(db, 'project-1', 1, delta)
+  assert.equal(getLatestCharacterStates(db, 'project-1', ['林岚']).length, 1)
+  db.exec('ROLLBACK')
+
+  assert.deepEqual(getLatestCharacterStates(db, 'project-1', ['林岚']), [])
 })
 
 test('P7.0 账本自身账：init 写 schema_version，读写与幂等', () => {

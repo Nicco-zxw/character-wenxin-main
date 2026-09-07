@@ -12,8 +12,7 @@
 import type { DatabaseSync } from 'node:sqlite'
 import { runLightCheck } from '../audit/light-check'
 import {
-  applyStateDelta,
-  summarizeChapterAfterSettlement,
+  readProjectLedger,
   type StoryStateContext,
   type StateDelta
 } from '../../story-state-store'
@@ -25,9 +24,9 @@ import {
   readSettlementRun,
   recordSettlementRun,
   setSettlementRunTrace,
-  settlementContentHash,
-  snapshotSettlementState
+  settlementContentHash
 } from './settlement-store'
+import { commitSettlement } from './committer'
 import { expireForecastsOlderThan } from '../forecast/store'
 import { CONTEXT_TRACE_ON, buildTraceFromStoryContext, createContextTrace, evaluateContextBudget } from '../context-trace'
 import { acquireBookLock, heartbeatBookLock, releaseBookLock } from '../locking/book-lock'
@@ -115,6 +114,7 @@ async function runChapterSettlementUnlocked(
 ): Promise<SettlementOutcome> {
   const policy: SettlementPolicy = { ...DEFAULT_SETTLEMENT_POLICY, ...params.policy }
   const contentHash = params.contentHash ?? settlementContentHash(params.content)
+  const baseLedgerVersion = readProjectLedger(db, params.projectId).ledgerVersion
 
   // 幂等守卫：同一正文已结算且不允许重放 → 跳过（不落账）。
   if (!policy.allowReapply && hasSettledContent(db, params.projectId, params.chapterIndex, contentHash)) {
@@ -145,6 +145,7 @@ async function runChapterSettlementUnlocked(
 
   // 自动重观察：仅当首轮为 retry_observe 且提供回调时执行一次。
   let attemptsUsed = 1
+  let settledDelta = firstDelta
   if (decision.type === 'retry_observe') {
     // 记录中间裁决，保证「拒绝→重试→再裁决」的审计路径可见。
     recordSettlementRun(db, {
@@ -157,7 +158,9 @@ async function runChapterSettlementUnlocked(
       decision: 'retry_observe',
       issues: decision.issues,
       delta: firstDelta,
-      reason: decision.reason
+      reason: decision.reason,
+      baseLedgerVersion,
+      committedLedgerVersion: null
     })
 
     const feedback = summarizeIssues(decision.issues)
@@ -181,6 +184,7 @@ async function runChapterSettlementUnlocked(
         observeAttempt: 1,
         policy
       })
+      settledDelta = nextDelta
       attemptsUsed = 2
     } else {
       // 无法重观察 → 维持拒绝。
@@ -206,7 +210,15 @@ async function runChapterSettlementUnlocked(
     }
   }
 
-  return finalizeDecision(db, params, contentHash, decision, attemptsUsed, firstDelta)
+  return finalizeDecision(
+    db,
+    params,
+    contentHash,
+    decision,
+    attemptsUsed,
+    settledDelta,
+    baseLedgerVersion
+  )
 }
 
 /**
@@ -238,7 +250,8 @@ function finalizeDecision(
   contentHash: string,
   decision: ArbiterDecision,
   attemptsUsed: number,
-  originalDelta: StateDelta | null
+  originalDelta: StateDelta | null,
+  baseLedgerVersion: number
 ): SettlementOutcome {
   if (decision.type === 'skip' || decision.type === 'reject') {
     recordSettlementRun(db, {
@@ -251,7 +264,9 @@ function finalizeDecision(
       decision: decision.type,
       issues: decision.issues,
       delta: originalDelta,
-      reason: decision.reason
+      reason: decision.reason,
+      baseLedgerVersion,
+      committedLedgerVersion: null
     })
     return {
       status: decision.status,
@@ -262,41 +277,32 @@ function finalizeDecision(
     }
   }
 
-  // apply / apply_with_warning：快照 → 落账 → 记账。
-  // 注意：结算成功后**保留**该章快照，供后续按章回滚（rollback IPC）恢复到结算前状态；
-  // 同一章的再次结算会先清旧快照再写新快照；回滚消费后由调用方清理。
-  // P7.2：预生成 runId，使本次结算的「快照 / 状态行(source_event_id) / 账本记录」指向同一事件，
-  // 从而状态行可反查是哪次结算、由谁触发。
-  const scope = scopeFromDelta(originalDelta)
+  // apply / apply_with_warning：快照、Reducer、摘要、版本推进和成功记账原子提交。
+  // 成功后保留该章快照，供后续按章回滚恢复到结算前状态。
   const runId = newSettlementRunId()
-  snapshotSettlementState(db, params.projectId, params.chapterIndex, scope, runId)
 
   try {
-    if (originalDelta) {
-      applyStateDelta(db, params.projectId, params.chapterIndex, originalDelta, {
-        sourceEventId: runId,
-        actor: 'observer'
-      })
+    if (decision.type !== 'apply' && decision.type !== 'apply_with_warning') {
+      throw new Error(`UNRESOLVED_SETTLEMENT_DECISION: ${decision.type}`)
     }
-    recordSettlementRun(db, {
-      id: runId,
+    if (!originalDelta) {
+      throw new Error('结算裁决允许提交，但缺少状态增量')
+    }
+    commitSettlement(db, {
+      runId,
       projectId: params.projectId,
       chapterId: params.chapterId,
       chapterIndex: params.chapterIndex,
       contentHash,
+      baseLedgerVersion,
+      actor: 'observer',
       attempt: attemptsUsed,
-      status: decision.status,
+      status: decision.type === 'apply' ? 'settled' : 'settled_with_warning',
       decision: decision.type,
       issues: decision.issues,
       delta: originalDelta,
       reason: decision.reason
     })
-    // P7.3：落账后确定性生成/覆盖章摘要账（无 LLM；失败不阻断结算）
-    try {
-      summarizeChapterAfterSettlement(db, params.projectId, params.chapterIndex, originalDelta, runId)
-    } catch {
-      // 忽略：摘要失败不影响结算结果
-    }
     // P7.4/P6.4：结算上下文过程审计落账——记喂了什么 + 分层/token 粗估 + protected 预算评估 + 压缩记录（可回放；失败不阻断）并回填 trace_id
     if (CONTEXT_TRACE_ON && params.preState) {
       try {
@@ -350,7 +356,9 @@ function finalizeDecision(
         message: `状态落账失败：${error instanceof Error ? error.message : String(error)}`
       }],
       delta: originalDelta,
-      reason: 'applyStateDelta 抛出异常，事务已回滚，快照保留可回滚'
+      reason: '原子结算提交失败，事务已回滚',
+      baseLedgerVersion,
+      committedLedgerVersion: null
     })
     return {
       status: 'error',
@@ -390,26 +398,6 @@ function buildPreIssues(
     }))
   }
   return issues
-}
-
-/** 从 delta 收集需要快照/回滚的实体 id。 */
-function scopeFromDelta(delta: StateDelta | null): {
-  characterIds: string[]
-  foreshadowingIds: string[]
-  relationshipIds: string[]
-} {
-  if (!delta) return { characterIds: [], foreshadowingIds: [], relationshipIds: [] }
-  const foreshadowing = delta.foreshadowing_delta ?? { planted: [], advanced: [], resolved: [] }
-  const foreshadowingIds = [
-    ...(foreshadowing.planted ?? []).map((p) => p.id),
-    ...(foreshadowing.advanced ?? []).map((a) => a.id),
-    ...(foreshadowing.resolved ?? []).map((r) => r.id)
-  ]
-  return {
-    characterIds: delta.characters_updated.map((c) => c.character_id),
-    foreshadowingIds,
-    relationshipIds: delta.relationships_delta.map((r) => r.relationship_id)
-  }
 }
 
 function summarizeIssues(issues: SettlementIssue[]): string {

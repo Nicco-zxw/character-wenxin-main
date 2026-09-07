@@ -314,15 +314,13 @@ export interface SettlementSnapshotScope {
  * 落账前对受影响的实体做状态级快照。
  * 之后若结算被回滚，可依据快照把各实体恢复到结算前状态。
  */
-export function snapshotSettlementState(
+function snapshotSettlementStateCore(
   db: DatabaseSync,
   projectId: string,
   chapterIndex: number,
   scope: SettlementSnapshotScope,
   sourceEventId?: string | null
 ): void {
-  db.exec('BEGIN')
-  try {
     db.prepare('DELETE FROM settlement_snapshots WHERE project_id = ? AND chapter_index = ?')
       .run(projectId, chapterIndex)
 
@@ -368,6 +366,30 @@ export function snapshotSettlementState(
     insertStmt.run(uid(), projectId, chapterIndex, 'timeline', `ch${chapterIndex}`,
       timelineRow ? JSON.stringify(timelineRow) : null, sourceEventId ?? null, ts)
 
+}
+
+/** 在调用方已开启的事务中写入结算前快照。 */
+export function snapshotSettlementStateInTransaction(
+  db: DatabaseSync,
+  projectId: string,
+  chapterIndex: number,
+  scope: SettlementSnapshotScope,
+  sourceEventId?: string | null
+): void {
+  snapshotSettlementStateCore(db, projectId, chapterIndex, scope, sourceEventId)
+}
+
+/** 独立写入结算前快照；保留既有 API 的事务语义。 */
+export function snapshotSettlementState(
+  db: DatabaseSync,
+  projectId: string,
+  chapterIndex: number,
+  scope: SettlementSnapshotScope,
+  sourceEventId?: string | null
+): void {
+  db.exec('BEGIN')
+  try {
+    snapshotSettlementStateCore(db, projectId, chapterIndex, scope, sourceEventId)
     db.exec('COMMIT')
   } catch (error) {
     db.exec('ROLLBACK')

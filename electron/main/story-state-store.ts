@@ -892,7 +892,7 @@ export function getForeshadowingHealth(
 
 // ==================== Write Operations ====================
 
-export function applyStateDelta(
+function applyStateDeltaCore(
   db: DatabaseSync,
   projectId: string,
   chapterIndex: number,
@@ -902,8 +902,6 @@ export function applyStateDelta(
   const normalizedDelta = normalizeStateDelta(delta)
   const srcId = opts?.sourceEventId ?? null
   const srcActor = opts?.actor ?? 'observer'
-  db.exec('BEGIN')
-  try {
   const timestamp = now()
 
   // Character state updates
@@ -1156,7 +1154,31 @@ export function applyStateDelta(
     )
   }
 
-  db.exec('COMMIT')
+}
+
+/** 在调用方已开启的事务中应用状态增量，不自行提交或回滚。 */
+export function applyStateDeltaInTransaction(
+  db: DatabaseSync,
+  projectId: string,
+  chapterIndex: number,
+  delta: StateDelta,
+  opts?: { sourceEventId?: string | null; actor?: string }
+): void {
+  applyStateDeltaCore(db, projectId, chapterIndex, delta, opts)
+}
+
+/** 独立应用状态增量；保留既有 API 的原子事务语义。 */
+export function applyStateDelta(
+  db: DatabaseSync,
+  projectId: string,
+  chapterIndex: number,
+  delta: StateDelta,
+  opts?: { sourceEventId?: string | null; actor?: string }
+): void {
+  db.exec('BEGIN')
+  try {
+    applyStateDeltaCore(db, projectId, chapterIndex, delta, opts)
+    db.exec('COMMIT')
   } catch (error) {
     db.exec('ROLLBACK')
     throw error
