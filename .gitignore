@@ -62,6 +62,7 @@ scripts/eval/report/eval-llm-*.json
 .claude/
 .agents/
 .project-skills/
+.worktrees/
 skills-lock.json
 
 # OS files
