@@ -145,6 +145,21 @@ export function bookLockHeld(
   return { held: true, owner: row.owner, live: isLive(row, row.ttl_ms, nowMs) }
 }
 
+/** 在最终写事务内确认租约仍由原运行持有；令牌、所有者或存活性任一不符即拒绝写入。 */
+export function assertBookLockOwned(
+  db: DatabaseSync,
+  input: { scope: string; owner: string; token: string; now?: number }
+): void {
+  const row = readLock(db, input.scope)
+  const nowMs = input.now ?? Date.now()
+  if (!row
+    || row.owner !== input.owner
+    || row.token !== input.token
+    || !isLive(row, row.ttl_ms, nowMs)) {
+    throw new BookWriteLockError(input.scope, row?.owner ?? null)
+  }
+}
+
 /** 强制清理指定 scope 的锁（管理员/测试用；生产建议用过期抢占而非强删）。 */
 export function forceClearBookLock(db: DatabaseSync, scope: string): boolean {
   const result = db.prepare('DELETE FROM book_locks WHERE scope = ?').run(scope)

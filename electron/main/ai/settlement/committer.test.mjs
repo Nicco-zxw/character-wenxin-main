@@ -10,9 +10,15 @@ import {
 } from '../../story-state-store.ts'
 import {
   initSettlementSchema,
-  readSettlementRun
+  readSettlementRun,
+  settlementContentHash
 } from './settlement-store.ts'
 import { commitSettlement } from './committer.ts'
+import {
+  acquireBookLock,
+  initBookLockSchema,
+  releaseBookLock
+} from '../locking/book-lock.ts'
 
 function makeDb() {
   const db = new DatabaseSync(':memory:')
@@ -21,13 +27,16 @@ function makeDb() {
       id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL,
       title TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL DEFAULT '',
       sort_order INTEGER NOT NULL DEFAULT 0
     ) STRICT;
-    INSERT INTO chapters (id, project_id, title, sort_order)
-    VALUES ('c1', 'p', '第一章', 1);
+    INSERT INTO chapters (id, project_id, title, content, sort_order)
+    VALUES ('c1', 'p', '第一章', '正文', 1);
   `)
   initStoryStateSchema(db)
   initSettlementSchema(db)
+  initBookLockSchema(db)
+  acquireBookLock(db, { scope: 'settle:p:0', owner: 'chapter:c1', token: 'lock-1' })
   return db
 }
 
@@ -50,9 +59,10 @@ const input = {
   runId: 'run-atomic',
   projectId: 'p',
   chapterId: 'c1',
-  chapterIndex: 1,
-  contentHash: 'hash',
+  chapterIndex: 0,
+  contentHash: settlementContentHash('正文'),
   baseLedgerVersion: 0,
+  lock: { scope: 'settle:p:0', owner: 'chapter:c1', token: 'lock-1' },
   actor: 'observer',
   delta,
   issues: [],
@@ -93,18 +103,80 @@ test('成功提交一次性推进状态、摘要、账本版本与结算记录',
   db.prepare(`
     INSERT INTO chapter_resettlement_queue
       (project_id, chapter_id, chapter_index, reason, created_at, resolved_at)
-    VALUES ('p', 'c1', 1, '回溯后重结算', '2026-09-07T00:00:00.000Z', NULL)
+    VALUES ('p', 'c1', 0, '回溯后重结算', '2026-09-07T00:00:00.000Z', NULL)
   `).run()
   const result = commitSettlement(db, input)
 
   assert.deepEqual(result, { runId: 'run-atomic', committedLedgerVersion: 1 })
   assert.equal(getLatestCharacterStates(db, 'p', ['林岚'])[0].mentalState, '警觉')
-  assert.equal(readProjectLedger(db, 'p').settledThroughChapter, 1)
-  const run = readSettlementRun(db, 'p', 'c1', 1)
+  assert.equal(readProjectLedger(db, 'p').settledThroughChapter, 0)
+  const run = readSettlementRun(db, 'p', 'c1', 0)
   assert.equal(run?.baseLedgerVersion, 0)
   assert.equal(run?.committedLedgerVersion, 1)
   assert.ok(db.prepare(`
     SELECT resolved_at FROM chapter_resettlement_queue
     WHERE project_id = 'p' AND chapter_id = 'c1'
   `).get().resolved_at)
+})
+
+test('锁令牌已丢失时拒绝提交且不写入状态', () => {
+  const db = makeDb()
+  releaseBookLock(db, input.lock)
+
+  assert.throws(() => commitSettlement(db, input), /BOOK_BUSY/)
+  assert.equal(readProjectLedger(db, 'p').ledgerVersion, 0)
+  assert.deepEqual(getLatestCharacterStates(db, 'p', ['林岚']), [])
+})
+
+test('Observer 之后正文发生变化时拒绝旧增量', () => {
+  const db = makeDb()
+  db.prepare("UPDATE chapters SET content = '已修改正文' WHERE id = 'c1'").run()
+
+  assert.throws(() => commitSettlement(db, input), /STALE_CHAPTER_CONTENT/)
+  assert.equal(readProjectLedger(db, 'p').ledgerVersion, 0)
+})
+
+test('章节归属或顺序不匹配时拒绝提交', () => {
+  const db = makeDb()
+
+  assert.throws(
+    () => commitSettlement(db, { ...input, projectId: 'other' }),
+    /CHAPTER_SCOPE_MISMATCH/
+  )
+})
+
+test('回滚重结算必须从最早待处理章节开始', () => {
+  const db = makeDb()
+  db.prepare(`
+    INSERT INTO chapters (id, project_id, title, content, sort_order)
+    VALUES ('c2', 'p', '第二章', '正文二', 2)
+  `).run()
+  db.prepare(`
+    INSERT INTO chapter_resettlement_queue
+      (project_id, chapter_id, chapter_index, reason, created_at, resolved_at)
+    VALUES ('p', 'c1', 0, '待处理', '2026-09-07T00:00:00.000Z', NULL)
+  `).run()
+  acquireBookLock(db, { scope: 'settle:p:1', owner: 'chapter:c2', token: 'lock-2' })
+
+  assert.throws(
+    () => commitSettlement(db, {
+      ...input,
+      runId: 'run-out-of-order',
+      chapterId: 'c2',
+      chapterIndex: 1,
+      contentHash: settlementContentHash('正文二'),
+      lock: { scope: 'settle:p:1', owner: 'chapter:c2', token: 'lock-2' }
+    }),
+    /RESETTLEMENT_ORDER_VIOLATION/
+  )
+})
+
+test('较早章节再次结算不会让 settledThroughChapter 倒退', () => {
+  const db = makeDb()
+  bumpProjectLedger(db, 'p', { settledThroughChapter: 3 })
+
+  const result = commitSettlement(db, { ...input, baseLedgerVersion: 1 })
+
+  assert.equal(result.committedLedgerVersion, 2)
+  assert.equal(readProjectLedger(db, 'p').settledThroughChapter, 3)
 })

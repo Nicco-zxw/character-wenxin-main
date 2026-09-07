@@ -27,7 +27,6 @@ import {
   settlementContentHash
 } from './settlement-store'
 import { commitSettlement } from './committer'
-import { expireForecastsOlderThan } from '../forecast/store'
 import { CONTEXT_TRACE_ON, buildTraceFromStoryContext, createContextTrace, evaluateContextBudget } from '../context-trace'
 import { acquireBookLock, heartbeatBookLock, releaseBookLock } from '../locking/book-lock'
 import {
@@ -88,20 +87,21 @@ export async function runChapterSettlement(
   const owner = params.chapterId ? `chapter:${params.chapterId}` : scope
   const token = `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
   acquireBookLock(db, { scope, owner, token })
+  const lockGuard = { scope, owner, token, lost: false }
 
   // P6.1.3：结算可能跨 reconcile/observe 的 LLM 等待（通常远小于租约，但保守起见）
   // 定时心跳保活，防止长时间任务期间锁过期被并发任务抢占。
   const heartbeatInterval = 25_000
   const heartbeatTimer = setInterval(() => {
     try {
-      heartbeatBookLock(db, { scope, owner, token })
+      if (!heartbeatBookLock(db, { scope, owner, token })) lockGuard.lost = true
     } catch {
-      // 心跳失败不阻断结算；若锁已丢失，由结算本身的幂等/乐观更新兜底
+      lockGuard.lost = true
     }
   }, heartbeatInterval)
 
   try {
-    return await runChapterSettlementUnlocked(db, params)
+    return await runChapterSettlementUnlocked(db, params, lockGuard)
   } finally {
     clearInterval(heartbeatTimer)
     releaseBookLock(db, { scope, owner, token })
@@ -110,7 +110,8 @@ export async function runChapterSettlement(
 
 async function runChapterSettlementUnlocked(
   db: DatabaseSync,
-  params: SettleChapterParams
+  params: SettleChapterParams,
+  lockGuard: { scope: string; owner: string; token: string; lost: boolean }
 ): Promise<SettlementOutcome> {
   const policy: SettlementPolicy = { ...DEFAULT_SETTLEMENT_POLICY, ...params.policy }
   const contentHash = params.contentHash ?? settlementContentHash(params.content)
@@ -217,7 +218,8 @@ async function runChapterSettlementUnlocked(
     decision,
     attemptsUsed,
     settledDelta,
-    baseLedgerVersion
+    baseLedgerVersion,
+    lockGuard
   )
 }
 
@@ -251,7 +253,8 @@ function finalizeDecision(
   decision: ArbiterDecision,
   attemptsUsed: number,
   originalDelta: StateDelta | null,
-  baseLedgerVersion: number
+  baseLedgerVersion: number,
+  lockGuard: { scope: string; owner: string; token: string; lost: boolean }
 ): SettlementOutcome {
   if (decision.type === 'skip' || decision.type === 'reject') {
     recordSettlementRun(db, {
@@ -295,6 +298,12 @@ function finalizeDecision(
       chapterIndex: params.chapterIndex,
       contentHash,
       baseLedgerVersion,
+      lock: {
+        scope: lockGuard.scope,
+        owner: lockGuard.owner,
+        token: lockGuard.token
+      },
+      lockLost: lockGuard.lost,
       actor: 'observer',
       attempt: attemptsUsed,
       status: decision.type === 'apply' ? 'settled' : 'settled_with_warning',
@@ -326,12 +335,6 @@ function finalizeDecision(
       } catch {
         // 忽略：trace 失败不影响结算
       }
-    }
-    // P6.2.3：正史已推进 → 把 base 更早的 forecast 标记过期（不删除，可审计；失败不阻断结算）
-    try {
-      expireForecastsOlderThan(db, params.projectId, params.chapterIndex)
-    } catch {
-      // 忽略：过期失败不影响结算结果
     }
     return {
       status: decision.status,
