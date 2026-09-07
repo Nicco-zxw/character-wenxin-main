@@ -180,3 +180,29 @@ test('较早章节再次结算不会让 settledThroughChapter 倒退', () => {
   assert.equal(result.committedLedgerVersion, 2)
   assert.equal(readProjectLedger(db, 'p').settledThroughChapter, 3)
 })
+
+test('forecast 失效与正史提交处于同一事务', () => {
+  const db = makeDb()
+  db.exec(`
+    CREATE TABLE narrative_forecasts (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      base_chapter_index INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    INSERT INTO narrative_forecasts
+      (id, project_id, base_chapter_index, status, updated_at)
+    VALUES ('f1', 'p', -1, 'active', '2026-09-07T00:00:00.000Z');
+  `)
+
+  assert.throws(
+    () => commitSettlement(db, input, {
+      afterForecastInvalidation: () => { throw new Error('forecast-injected') }
+    }),
+    /forecast-injected/
+  )
+  assert.equal(db.prepare("SELECT status FROM narrative_forecasts WHERE id = 'f1'").get().status, 'active')
+  assert.equal(readProjectLedger(db, 'p').ledgerVersion, 0)
+  assert.deepEqual(getLatestCharacterStates(db, 'p', ['林岚']), [])
+})

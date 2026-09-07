@@ -36,6 +36,7 @@ export interface CommitSettlementInput {
 export interface SettlementCommitHooks {
   afterReducer?(): void
   afterSummary?(): void
+  afterForecastInvalidation?(): void
 }
 
 /** 从状态增量唯一地推导快照范围，供编排与提交路径共同复用。 */
@@ -144,6 +145,7 @@ export function commitSettlement(
         WHERE project_id = ? AND base_chapter_index < ? AND status IN ('active', 'selected')
       `).run(new Date().toISOString(), input.projectId, input.chapterIndex)
     }
+    hooks.afterForecastInvalidation?.()
 
     const committedLedgerVersion = bumpProjectLedger(db, input.projectId, {
       settledThroughChapter: Math.max(current.settledThroughChapter, input.chapterIndex)
