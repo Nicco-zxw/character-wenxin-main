@@ -287,6 +287,14 @@ export interface StoryStateContext {
   activeClocks: CountdownClock[]
 }
 
+export interface ProjectLedgerState {
+  projectId: string
+  ledgerVersion: number
+  settledThroughChapter: number
+  projectionsDirty: boolean
+  updatedAt: string
+}
+
 // ==================== Schema ====================
 
 const STORY_STATE_SCHEMA = `
@@ -414,6 +422,14 @@ const STORY_STATE_SCHEMA = `
   CREATE TABLE IF NOT EXISTS ledger_manifest (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS story_project_ledgers (
+    project_id TEXT PRIMARY KEY,
+    ledger_version INTEGER NOT NULL DEFAULT 0,
+    settled_through_chapter INTEGER NOT NULL DEFAULT -1,
+    projections_dirty INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL
   ) STRICT;
 
@@ -594,6 +610,53 @@ export function writeLedgerValue(db: DatabaseSync, key: string, value: string): 
     INSERT INTO ledger_manifest (key, value, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
   `).run(key, value, now())
+}
+
+/** 读取单个项目的内容账本版本；尚未结算的项目返回稳定的初始态。 */
+export function readProjectLedger(db: DatabaseSync, projectId: string): ProjectLedgerState {
+  const row = db.prepare(`
+    SELECT project_id, ledger_version, settled_through_chapter, projections_dirty, updated_at
+    FROM story_project_ledgers
+    WHERE project_id = ?
+  `).get(projectId) as Record<string, unknown> | undefined
+
+  if (!row) {
+    return {
+      projectId,
+      ledgerVersion: 0,
+      settledThroughChapter: -1,
+      projectionsDirty: true,
+      updatedAt: ''
+    }
+  }
+
+  return {
+    projectId: String(row.project_id),
+    ledgerVersion: Number(row.ledger_version),
+    settledThroughChapter: Number(row.settled_through_chapter),
+    projectionsDirty: Number(row.projections_dirty) === 1,
+    updatedAt: String(row.updated_at)
+  }
+}
+
+/** 在调用方事务内推进项目账本版本，并标记所有可再生投影为脏。 */
+export function bumpProjectLedger(
+  db: DatabaseSync,
+  projectId: string,
+  input: { settledThroughChapter: number }
+): number {
+  const timestamp = now()
+  db.prepare(`
+    INSERT INTO story_project_ledgers
+      (project_id, ledger_version, settled_through_chapter, projections_dirty, updated_at)
+    VALUES (?, 1, ?, 1, ?)
+    ON CONFLICT(project_id) DO UPDATE SET
+      ledger_version = ledger_version + 1,
+      settled_through_chapter = excluded.settled_through_chapter,
+      projections_dirty = 1,
+      updated_at = excluded.updated_at
+  `).run(projectId, input.settledThroughChapter, timestamp)
+  return readProjectLedger(db, projectId).ledgerVersion
 }
 
 /** 行 → CharacterState（读路径统一映射）。 */

@@ -4,6 +4,7 @@ import test from 'node:test'
 
 import {
   applyStateDelta,
+  bumpProjectLedger,
   buildTruthProjectionMarkdown,
   getCharacterStateAtChapter,
   getLatestCharacterStates,
@@ -16,12 +17,26 @@ import {
   queryStateAtChapter,
   readChapterSummary,
   readLedgerValue,
+  readProjectLedger,
   setStoryStateClosureEnabled,
   STORY_STATE_CLOSURE_ENABLED,
   summarizeChapterAfterSettlement,
   TRUTH_LEDGER_SCHEMA_VERSION,
   writeLedgerValue
 } from './story-state-store.ts'
+
+test('项目账本版本彼此隔离且事务内单调递增', () => {
+  const db = new DatabaseSync(':memory:')
+  initStoryStateSchema(db)
+  assert.equal(readProjectLedger(db, 'p1').ledgerVersion, 0)
+  assert.equal(bumpProjectLedger(db, 'p1', { settledThroughChapter: 2 }), 1)
+  assert.equal(bumpProjectLedger(db, 'p1', { settledThroughChapter: 3 }), 2)
+  assert.equal(readProjectLedger(db, 'p1').settledThroughChapter, 3)
+  assert.equal(readProjectLedger(db, 'p2').ledgerVersion, 0)
+
+  initStoryStateSchema(db)
+  assert.equal(readProjectLedger(db, 'p1').ledgerVersion, 2)
+})
 
 test('畸形状态增量会被规范化为可遍历、可绑定的字段', () => {
   const delta = normalizeStateDelta({
