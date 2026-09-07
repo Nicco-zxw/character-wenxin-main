@@ -325,6 +325,8 @@ const STORY_STATE_SCHEMA = `
     valid_until_chapter INTEGER,
     source_event_id TEXT,
     actor TEXT NOT NULL DEFAULT 'observer',
+    invalidated_at TEXT,
+    invalidated_by_run_id TEXT,
     updated_at TEXT NOT NULL
   ) STRICT;
 
@@ -343,11 +345,10 @@ const STORY_STATE_SCHEMA = `
     connections_json TEXT NOT NULL DEFAULT '[]',
     source_event_id TEXT,
     actor TEXT NOT NULL DEFAULT 'observer',
+    invalidated_at TEXT,
+    invalidated_by_run_id TEXT,
     updated_at TEXT NOT NULL
   ) STRICT;
-
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_foreshadowing_project_fid
-    ON story_foreshadowing(project_id, foreshadowing_id);
 
   CREATE TABLE IF NOT EXISTS story_relationships (
     id TEXT PRIMARY KEY,
@@ -363,6 +364,8 @@ const STORY_STATE_SCHEMA = `
     valid_until_chapter INTEGER,
     source_event_id TEXT,
     actor TEXT NOT NULL DEFAULT 'observer',
+    invalidated_at TEXT,
+    invalidated_by_run_id TEXT,
     updated_at TEXT NOT NULL
   ) STRICT;
 
@@ -373,11 +376,10 @@ const STORY_STATE_SCHEMA = `
     story_date TEXT NOT NULL DEFAULT '',
     events_json TEXT NOT NULL DEFAULT '[]',
     world_state_changes_json TEXT NOT NULL DEFAULT '[]',
+    invalidated_at TEXT,
+    invalidated_by_run_id TEXT,
     updated_at TEXT NOT NULL
   ) STRICT;
-
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_timeline_unique
-    ON story_timeline(project_id, chapter_index);
 
   CREATE TABLE IF NOT EXISTS story_world_rules (
     id TEXT PRIMARY KEY,
@@ -389,11 +391,10 @@ const STORY_STATE_SCHEMA = `
     must_comply INTEGER NOT NULL DEFAULT 1,
     source_event_id TEXT,
     actor TEXT NOT NULL DEFAULT 'observer',
+    invalidated_at TEXT,
+    invalidated_by_run_id TEXT,
     updated_at TEXT NOT NULL
   ) STRICT;
-
-  CREATE UNIQUE INDEX IF NOT EXISTS idx_world_rules_project_rid
-    ON story_world_rules(project_id, rule_id);
 
   CREATE TABLE IF NOT EXISTS story_countdown_clocks (
     id TEXT PRIMARY KEY,
@@ -482,7 +483,7 @@ const STORY_STATE_SCHEMA = `
 // ==================== Ledger Manifest ====================
 
 /** 真相账本结构版本（ledger_manifest.schema_version）。升版需随迁移 writeLedgerValue 留痕。 */
-export const TRUTH_LEDGER_SCHEMA_VERSION = '3'
+export const TRUTH_LEDGER_SCHEMA_VERSION = '4'
 
 /**
  * P7.1/B1 状态行 closure 语义总开关（默认开）。
@@ -546,6 +547,16 @@ export function initStoryStateSchema(db: DatabaseSync): void {
     ensureColumn(db, table, 'source_event_id', 'source_event_id TEXT')
     ensureColumn(db, table, 'actor', "actor TEXT NOT NULL DEFAULT 'observer'")
   }
+  for (const table of [
+    'story_character_state',
+    'story_foreshadowing',
+    'story_relationships',
+    'story_timeline',
+    'story_world_rules'
+  ]) {
+    ensureColumn(db, table, 'invalidated_at', 'invalidated_at TEXT')
+    ensureColumn(db, table, 'invalidated_by_run_id', 'invalidated_by_run_id TEXT')
+  }
   // P7.5：向量索引版本/生效列（content_hash=所索引文本版本；valid_until 预留 closure 生效区间，NULL=当前）
   ensureColumn(db, 'story_embeddings', 'content_hash', 'content_hash TEXT')
   ensureColumn(db, 'story_embeddings', 'valid_until_chapter', 'valid_until_chapter INTEGER')
@@ -555,7 +566,7 @@ export function initStoryStateSchema(db: DatabaseSync): void {
   if (STORY_STATE_CLOSURE_ENABLED) {
     // ── 存量规范化（幂等；必须在建「当前行部分唯一」索引之前）──
     // 1) valid_from 回填 = 真实来源章
-    db.exec('UPDATE story_character_state SET valid_from_chapter = chapter_index WHERE valid_from_chapter = 0')
+    db.exec('UPDATE story_character_state SET valid_from_chapter = chapter_index WHERE valid_from_chapter = 0 AND invalidated_at IS NULL')
     // 2) 旧 REPLACE 语义下同一角色跨章保留多行、加列后全为 until=NULL；
     //    把「非最大章」行关门到下一章-1 → 每角色仅最大章一行保持 NULL（当前态），
     //    历史任意章点可查；若曾出现双 NULL（异常/半迁移）此步亦自愈。
@@ -565,38 +576,42 @@ export function initStoryStateSchema(db: DatabaseSync): void {
         SELECT MIN(s2.chapter_index) - 1 FROM story_character_state s2
         WHERE s2.project_id = story_character_state.project_id
           AND s2.character_id = story_character_state.character_id
+          AND s2.invalidated_at IS NULL
           AND s2.chapter_index > story_character_state.chapter_index
       )
-      WHERE valid_until_chapter IS NULL
+      WHERE valid_until_chapter IS NULL AND invalidated_at IS NULL
         AND EXISTS (
           SELECT 1 FROM story_character_state s3
           WHERE s3.project_id = story_character_state.project_id
             AND s3.character_id = story_character_state.character_id
+            AND s3.invalidated_at IS NULL
             AND s3.chapter_index > story_character_state.chapter_index
         )
     `)
     // B1：关系存量规范化——旧语义单行 → valid_from=最近互动章；异常多行按 last_interaction 关门到下一-1
-    db.exec('UPDATE story_relationships SET valid_from_chapter = COALESCE(last_interaction_chapter, 0) WHERE valid_from_chapter = 0')
+    db.exec('UPDATE story_relationships SET valid_from_chapter = COALESCE(last_interaction_chapter, 0) WHERE valid_from_chapter = 0 AND invalidated_at IS NULL')
     db.exec(`
       UPDATE story_relationships
       SET valid_until_chapter = (
         SELECT MIN(s2.last_interaction_chapter) - 1 FROM story_relationships s2
         WHERE s2.project_id = story_relationships.project_id
           AND s2.relationship_id = story_relationships.relationship_id
+          AND s2.invalidated_at IS NULL
           AND s2.last_interaction_chapter > story_relationships.last_interaction_chapter
       )
-      WHERE valid_until_chapter IS NULL
+      WHERE valid_until_chapter IS NULL AND invalidated_at IS NULL
         AND last_interaction_chapter IS NOT NULL
         AND EXISTS (
           SELECT 1 FROM story_relationships s3
           WHERE s3.project_id = story_relationships.project_id
             AND s3.relationship_id = story_relationships.relationship_id
+            AND s3.invalidated_at IS NULL
             AND s3.last_interaction_chapter > story_relationships.last_interaction_chapter
         )
     `)
   } else {
     // 非 closure：仍回填 valid_from（供查询展示），无部分唯一约束
-    db.exec('UPDATE story_character_state SET valid_from_chapter = chapter_index WHERE valid_from_chapter = 0')
+    db.exec('UPDATE story_character_state SET valid_from_chapter = chapter_index WHERE valid_from_chapter = 0 AND invalidated_at IS NULL')
   }
 
   // ── 唯一索引按 closure 开关重建（可回退）──
@@ -604,10 +619,12 @@ export function initStoryStateSchema(db: DatabaseSync): void {
   db.exec('DROP INDEX IF EXISTS idx_char_state_current')
   if (STORY_STATE_CLOSURE_ENABLED) {
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_char_state_current
-      ON story_character_state(project_id, character_id) WHERE valid_until_chapter IS NULL`)
+      ON story_character_state(project_id, character_id)
+      WHERE valid_until_chapter IS NULL AND invalidated_at IS NULL`)
   } else {
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_char_state_unique
-      ON story_character_state(project_id, character_id, chapter_index)`)
+      ON story_character_state(project_id, character_id, chapter_index)
+      WHERE invalidated_at IS NULL`)
   }
 
   // ── B1：关系唯一索引按 closure 开关重建（可回退）──
@@ -615,10 +632,21 @@ export function initStoryStateSchema(db: DatabaseSync): void {
   db.exec('DROP INDEX IF EXISTS idx_relationships_current')
   if (STORY_STATE_CLOSURE_ENABLED) {
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_relationships_current
-      ON story_relationships(project_id, relationship_id) WHERE valid_until_chapter IS NULL`)
+      ON story_relationships(project_id, relationship_id)
+      WHERE valid_until_chapter IS NULL AND invalidated_at IS NULL`)
   } else {
     db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_relationships_project_rid
-      ON story_relationships(project_id, relationship_id)`)
+      ON story_relationships(project_id, relationship_id)
+      WHERE invalidated_at IS NULL`)
+  }
+
+  for (const [index, table, columns] of [
+    ['idx_foreshadowing_project_fid', 'story_foreshadowing', 'project_id, foreshadowing_id'],
+    ['idx_timeline_unique', 'story_timeline', 'project_id, chapter_index'],
+    ['idx_world_rules_project_rid', 'story_world_rules', 'project_id, rule_id']
+  ]) {
+    db.exec(`DROP INDEX IF EXISTS ${index}`)
+    db.exec(`CREATE UNIQUE INDEX ${index} ON ${table}(${columns}) WHERE invalidated_at IS NULL`)
   }
 
   // ── 账本自身账：写/升结构版本（只升不降，留痕）──
@@ -626,7 +654,7 @@ export function initStoryStateSchema(db: DatabaseSync): void {
   const current = existing == null ? 0 : Number(existing) || 0
   if (current < Number(TRUTH_LEDGER_SCHEMA_VERSION)) {
     writeLedgerValue(db, 'schema_version', TRUTH_LEDGER_SCHEMA_VERSION)
-    writeLedgerValue(db, 'migration', `schema ${existing ?? 'none'} -> ${TRUTH_LEDGER_SCHEMA_VERSION} (P7.1 character + B1 relationship closure)`)
+    writeLedgerValue(db, 'migration', `schema ${existing ?? 'none'} -> ${TRUTH_LEDGER_SCHEMA_VERSION} (logical rollback invalidation)`)
   }
 }
 
@@ -776,71 +804,111 @@ export function applyRollbackPlan(
       )
     }
 
-    db.prepare('DELETE FROM story_character_state WHERE project_id = ? AND valid_from_chapter > ?')
-      .run(plan.projectId, plan.targetChapter)
+    const chapters = db.prepare(`
+      SELECT id FROM chapters WHERE project_id = ?
+      ORDER BY sort_order ASC, rowid ASC
+    `).all(plan.projectId) as Array<{ id: string }>
+    if (!Number.isInteger(plan.targetChapter)
+      || plan.targetChapter < 0
+      || plan.targetChapter >= chapters.length) {
+      throw new Error(`TARGET_CHAPTER_OUT_OF_RANGE: ${plan.targetChapter}`)
+    }
+    // 客户端计划仅用于携带请求参数；实际影响范围必须在持有写事务时重算。
+    plan = planRollbackToChapter(db, plan.projectId, plan.targetChapter)
+    const rollbackId = `rollback-${uid()}`
+    const timestamp = now()
+
+    db.prepare(`
+      UPDATE story_character_state
+      SET invalidated_at = ?, invalidated_by_run_id = ?
+      WHERE project_id = ? AND valid_from_chapter > ? AND invalidated_at IS NULL
+    `).run(timestamp, rollbackId, plan.projectId, plan.targetChapter)
     db.prepare(`
       UPDATE story_character_state AS current
       SET valid_until_chapter = NULL
       WHERE current.project_id = ? AND current.valid_from_chapter <= ?
+        AND current.invalidated_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM story_character_state newer
           WHERE newer.project_id = current.project_id
             AND newer.character_id = current.character_id
+            AND newer.invalidated_at IS NULL
             AND newer.valid_from_chapter <= ?
             AND newer.valid_from_chapter > current.valid_from_chapter
         )
     `).run(plan.projectId, plan.targetChapter, plan.targetChapter)
-    db.prepare('DELETE FROM story_relationships WHERE project_id = ? AND valid_from_chapter > ?')
-      .run(plan.projectId, plan.targetChapter)
+    db.prepare(`
+      UPDATE story_relationships
+      SET invalidated_at = ?, invalidated_by_run_id = ?
+      WHERE project_id = ? AND valid_from_chapter > ? AND invalidated_at IS NULL
+    `).run(timestamp, rollbackId, plan.projectId, plan.targetChapter)
     db.prepare(`
       UPDATE story_relationships AS current
       SET valid_until_chapter = NULL
       WHERE current.project_id = ? AND current.valid_from_chapter <= ?
+        AND current.invalidated_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM story_relationships newer
           WHERE newer.project_id = current.project_id
             AND newer.relationship_id = current.relationship_id
+            AND newer.invalidated_at IS NULL
             AND newer.valid_from_chapter <= ?
             AND newer.valid_from_chapter > current.valid_from_chapter
         )
     `).run(plan.projectId, plan.targetChapter, plan.targetChapter)
-    db.prepare('DELETE FROM story_timeline WHERE project_id = ? AND chapter_index > ?')
-      .run(plan.projectId, plan.targetChapter)
-    db.prepare('DELETE FROM story_world_rules WHERE project_id = ? AND established_chapter > ?')
-      .run(plan.projectId, plan.targetChapter)
+    db.prepare(`
+      UPDATE story_timeline SET invalidated_at = ?, invalidated_by_run_id = ?
+      WHERE project_id = ? AND chapter_index > ? AND invalidated_at IS NULL
+    `).run(timestamp, rollbackId, plan.projectId, plan.targetChapter)
+    db.prepare(`
+      UPDATE story_world_rules SET invalidated_at = ?, invalidated_by_run_id = ?
+      WHERE project_id = ? AND established_chapter > ? AND invalidated_at IS NULL
+    `).run(timestamp, rollbackId, plan.projectId, plan.targetChapter)
 
-    db.prepare('DELETE FROM story_foreshadowing WHERE project_id = ? AND planted_chapter > ?')
-      .run(plan.projectId, plan.targetChapter)
     const foreshadowRows = db.prepare(`
-      SELECT foreshadowing_id, status, resolved_chapter, clues_json
-      FROM story_foreshadowing WHERE project_id = ?
+      SELECT * FROM story_foreshadowing
+      WHERE project_id = ? AND invalidated_at IS NULL
     `).all(plan.projectId) as Array<Record<string, unknown>>
     for (const row of foreshadowRows) {
-      const clues = parseJson<Array<{ chapter: number; clue: string; method: string }>>(row.clues_json, [])
+      const originalClues = parseJson<Array<{ chapter: number; clue: string; method: string }>>(row.clues_json, [])
+      const clues = originalClues
         .filter((clue) => Number(clue.chapter) <= plan.targetChapter)
+      const plantedChapter = Number(row.planted_chapter)
       const resolvedChapter = row.resolved_chapter == null ? null : Number(row.resolved_chapter)
       const resolutionInvalid = resolvedChapter != null && resolvedChapter > plan.targetChapter
+      const hasFutureClues = clues.length !== originalClues.length
+      if (plantedChapter > plan.targetChapter) {
+        db.prepare(`
+          UPDATE story_foreshadowing SET invalidated_at = ?, invalidated_by_run_id = ?
+          WHERE id = ?
+        `).run(timestamp, rollbackId, String(row.id))
+        continue
+      }
+      if (!resolutionInvalid && !hasFutureClues) continue
+
       const status = resolutionInvalid
         ? (clues.length ? 'advanced' : 'active')
         : String(row.status)
       db.prepare(`
         UPDATE story_foreshadowing
-        SET clues_json = ?, status = ?, resolved_chapter = ?, source_event_id = NULL,
-            actor = 'rollback', updated_at = ?
-        WHERE project_id = ? AND foreshadowing_id = ?
+        SET invalidated_at = ?, invalidated_by_run_id = ? WHERE id = ?
+      `).run(timestamp, rollbackId, String(row.id))
+      db.prepare(`
+        INSERT INTO story_foreshadowing
+          (id, project_id, foreshadowing_id, type, description, status, planted_chapter,
+           planted_method, payoff_chapter, resolved_chapter, clues_json, connections_json,
+           source_event_id, actor, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'rollback', ?)
       `).run(
-        JSON.stringify(clues),
-        status,
-        resolutionInvalid ? null : resolvedChapter,
-        now(),
-        plan.projectId,
-        String(row.foreshadowing_id)
+        uid(), plan.projectId, String(row.foreshadowing_id), String(row.type),
+        String(row.description), status, plantedChapter, String(row.planted_method ?? ''),
+        row.payoff_chapter == null ? null : Number(row.payoff_chapter),
+        resolutionInvalid ? null : resolvedChapter, JSON.stringify(clues),
+        String(row.connections_json ?? '[]'), timestamp
       )
     }
     hooks.afterState?.()
 
-    const rollbackId = `rollback-${uid()}`
-    const timestamp = now()
     db.prepare(`
       UPDATE settlement_runs SET invalidated_at = ?, invalidated_by_run_id = ?
       WHERE project_id = ? AND chapter_index > ? AND invalidated_at IS NULL
@@ -861,10 +929,6 @@ export function applyRollbackPlan(
     }
     hooks.afterInvalidation?.()
 
-    const chapters = db.prepare(`
-      SELECT id FROM chapters WHERE project_id = ?
-      ORDER BY sort_order ASC, rowid ASC
-    `).all(plan.projectId) as Array<{ id: string }>
     const retained = new Set(plan.retainedChapterIds)
     const queue = db.prepare(`
       INSERT INTO chapter_resettlement_queue
@@ -947,16 +1011,17 @@ function readLatestCharacterRows(
       INNER JOIN (
         SELECT character_id, MAX(chapter_index) as max_ch
         FROM story_character_state
-        WHERE project_id = ? AND character_id IN (${placeholders})
+        WHERE project_id = ? AND character_id IN (${placeholders}) AND invalidated_at IS NULL
         GROUP BY character_id
       ) latest ON cs.character_id = latest.character_id AND cs.chapter_index = latest.max_ch
-      WHERE cs.project_id = ?
+      WHERE cs.project_id = ? AND cs.invalidated_at IS NULL
     `).all(projectId, ...characterIds, projectId) as Array<Record<string, unknown>>
   }
 
   const rows = db.prepare(`
     SELECT * FROM story_character_state
-    WHERE project_id = ? AND character_id IN (${placeholders}) AND valid_until_chapter IS NULL
+    WHERE project_id = ? AND character_id IN (${placeholders})
+      AND valid_until_chapter IS NULL AND invalidated_at IS NULL
   `).all(projectId, ...characterIds) as Array<Record<string, unknown>>
 
   // 兜底：缺失字符（无当前生效行）按最大 valid_from 取最近一行
@@ -969,10 +1034,10 @@ function readLatestCharacterRows(
       INNER JOIN (
         SELECT character_id, MAX(valid_from_chapter) as vf
         FROM story_character_state
-        WHERE project_id = ? AND character_id IN (${mp})
+        WHERE project_id = ? AND character_id IN (${mp}) AND invalidated_at IS NULL
         GROUP BY character_id
       ) latest ON cs.character_id = latest.character_id AND cs.valid_from_chapter = latest.vf
-      WHERE cs.project_id = ?
+      WHERE cs.project_id = ? AND cs.invalidated_at IS NULL
     `).all(projectId, ...missing, projectId) as Array<Record<string, unknown>>
     rows.push(...fallback)
   }
@@ -991,7 +1056,7 @@ export function getLatestCharacterStates(
 
 export function getAllCharacterIds(db: DatabaseSync, projectId: string): string[] {
   const stmt = db.prepare(
-    `SELECT DISTINCT character_id FROM story_character_state WHERE project_id = ?`
+    `SELECT DISTINCT character_id FROM story_character_state WHERE project_id = ? AND invalidated_at IS NULL`
   )
   const rows = stmt.all(projectId) as Array<Record<string, unknown>>
   return rows.map((row) => String(row.character_id))
@@ -1004,7 +1069,7 @@ export function getActiveForeshadowing(
 ): Foreshadowing[] {
   const stmt = db.prepare(`
     SELECT * FROM story_foreshadowing
-    WHERE project_id = ? AND status IN ('active', 'advanced')
+    WHERE project_id = ? AND invalidated_at IS NULL AND status IN ('active', 'advanced')
     ORDER BY planted_chapter ASC
     LIMIT ?
   `)
@@ -1053,9 +1118,10 @@ export function getRelationships(
   const rows = (STORY_STATE_CLOSURE_ENABLED
     ? db.prepare(`
         SELECT * FROM story_relationships
-        WHERE project_id = ?${filter ? filter.clause : ''} AND valid_until_chapter IS NULL
+        WHERE project_id = ?${filter ? filter.clause : ''}
+          AND valid_until_chapter IS NULL AND invalidated_at IS NULL
       `).all(projectId, ...(filter ? filter.params : []))
-    : db.prepare(`SELECT * FROM story_relationships WHERE project_id = ?${filter ? filter.clause : ''}`)
+    : db.prepare(`SELECT * FROM story_relationships WHERE project_id = ? AND invalidated_at IS NULL${filter ? filter.clause : ''}`)
         .all(projectId, ...(filter ? filter.params : []))) as Array<Record<string, unknown>>
   return rows.map(toRelationship)
 }
@@ -1072,6 +1138,7 @@ export function getRelationshipsAtChapter(
   const rows = db.prepare(`
     SELECT * FROM story_relationships
     WHERE project_id = ?
+      AND invalidated_at IS NULL
       AND valid_from_chapter <= ?
       AND (valid_until_chapter IS NULL OR valid_until_chapter >= ?)
       ${filter ? filter.clause : ''}
@@ -1086,7 +1153,7 @@ export function getRecentTimeline(
 ): TimelineEntry[] {
   const stmt = db.prepare(`
     SELECT * FROM story_timeline
-    WHERE project_id = ?
+    WHERE project_id = ? AND invalidated_at IS NULL
     ORDER BY chapter_index DESC
     LIMIT ?
   `)
@@ -1100,7 +1167,8 @@ export function getRecentTimeline(
 }
 
 export function getWorldRules(db: DatabaseSync, projectId: string): WorldRule[] {
-  const stmt = db.prepare(`SELECT * FROM story_world_rules WHERE project_id = ? ORDER BY established_chapter ASC`)
+  const stmt = db.prepare(`SELECT * FROM story_world_rules
+    WHERE project_id = ? AND invalidated_at IS NULL ORDER BY established_chapter ASC`)
   const rows = stmt.all(projectId) as Array<Record<string, unknown>>
   return rows.map((row) => ({
     ruleId: String(row.rule_id),
@@ -1199,7 +1267,7 @@ function applyStateDeltaCore(
       // 当前生效行（valid_until IS NULL；无则取最大 valid_from 兼容迁移遗漏）
       const cur = db.prepare(`
         SELECT id, valid_from_chapter FROM story_character_state
-        WHERE project_id = ? AND character_id = ?
+        WHERE project_id = ? AND character_id = ? AND invalidated_at IS NULL
         ORDER BY (valid_until_chapter IS NULL) DESC, valid_from_chapter DESC LIMIT 1
       `).get(projectId, charUpdate.character_id) as { id: string; valid_from_chapter: number } | undefined
 
@@ -1256,7 +1324,7 @@ function applyStateDeltaCore(
     if (!STORY_STATE_CLOSURE_ENABLED) {
       // 旧语义：单行累积（保持既有行为）
       const existingRow = db.prepare(
-        'SELECT * FROM story_relationships WHERE project_id = ? AND relationship_id = ?'
+        'SELECT * FROM story_relationships WHERE project_id = ? AND relationship_id = ? AND invalidated_at IS NULL'
       ).get(projectId, relId) as Record<string, unknown> | undefined
       if (existingRow) {
         const updates: string[] = []
@@ -1278,7 +1346,7 @@ function applyStateDeltaCore(
         params.push(chapterIndex, srcId, srcActor, timestamp)
         params.push(projectId, relId)
         db.prepare(
-          `UPDATE story_relationships SET ${updates.join(', ')} WHERE project_id = ? AND relationship_id = ?`
+          `UPDATE story_relationships SET ${updates.join(', ')} WHERE project_id = ? AND relationship_id = ? AND invalidated_at IS NULL`
         ).run(...params)
       } else if (participants && participants.length >= 2) {
         db.prepare(`
@@ -1301,7 +1369,7 @@ function applyStateDeltaCore(
     // closure 语义
     const cur = db.prepare(`
       SELECT * FROM story_relationships
-      WHERE project_id = ? AND relationship_id = ?
+      WHERE project_id = ? AND relationship_id = ? AND invalidated_at IS NULL
       ORDER BY (valid_until_chapter IS NULL) DESC, valid_from_chapter DESC LIMIT 1
     `).get(projectId, relId) as Record<string, unknown> | undefined
     const base = cur as Record<string, unknown> | undefined
@@ -1366,7 +1434,8 @@ function applyStateDeltaCore(
 
     for (const advanced of normalizedDelta.foreshadowing_delta.advanced) {
       const row = db.prepare(
-        `SELECT clues_json FROM story_foreshadowing WHERE project_id = ? AND foreshadowing_id = ?`
+        `SELECT clues_json FROM story_foreshadowing
+         WHERE project_id = ? AND foreshadowing_id = ? AND invalidated_at IS NULL`
       ).get(projectId, advanced.id) as Record<string, unknown> | undefined
 
       if (row) {
@@ -1379,7 +1448,7 @@ function applyStateDeltaCore(
           UPDATE story_foreshadowing
           SET clues_json = ?, status = 'advanced',
               source_event_id = ?, actor = ?, updated_at = ?
-          WHERE project_id = ? AND foreshadowing_id = ?
+          WHERE project_id = ? AND foreshadowing_id = ? AND invalidated_at IS NULL
         `).run(JSON.stringify(clues), srcId, srcActor, timestamp, projectId, advanced.id)
       }
     }
@@ -1389,7 +1458,7 @@ function applyStateDeltaCore(
         UPDATE story_foreshadowing
         SET status = 'resolved', resolved_chapter = ?,
             source_event_id = ?, actor = ?, updated_at = ?
-        WHERE project_id = ? AND foreshadowing_id = ?
+        WHERE project_id = ? AND foreshadowing_id = ? AND invalidated_at IS NULL
       `).run(chapterIndex, srcId, srcActor, timestamp, projectId, resolved.id)
     }
   }
@@ -1453,13 +1522,14 @@ export function getCharacterStateAtChapter(
     ? db.prepare(`
         SELECT * FROM story_character_state
         WHERE project_id = ? AND character_id = ?
+          AND invalidated_at IS NULL
           AND valid_from_chapter <= ?
           AND (valid_until_chapter IS NULL OR valid_until_chapter >= ?)
         ORDER BY valid_from_chapter DESC LIMIT 1
       `).get(projectId, characterId, chapterIndex, chapterIndex)
     : db.prepare(`
         SELECT * FROM story_character_state
-        WHERE project_id = ? AND character_id = ? AND chapter_index <= ?
+        WHERE project_id = ? AND character_id = ? AND invalidated_at IS NULL AND chapter_index <= ?
         ORDER BY chapter_index DESC LIMIT 1
       `).get(projectId, characterId, chapterIndex)) as Record<string, unknown> | undefined
   return row ? toCharacterState(row) : null
@@ -1480,6 +1550,7 @@ export function queryStateAtChapter(
   const fsRows = db.prepare(`
     SELECT * FROM story_foreshadowing
     WHERE project_id = ?
+      AND invalidated_at IS NULL
       AND planted_chapter <= ?
       AND status != 'abandoned'
       AND (resolved_chapter IS NULL OR resolved_chapter > ?)
@@ -1488,7 +1559,7 @@ export function queryStateAtChapter(
 
   const tlRows = db.prepare(`
     SELECT * FROM story_timeline
-    WHERE project_id = ? AND chapter_index <= ?
+    WHERE project_id = ? AND invalidated_at IS NULL AND chapter_index <= ?
     ORDER BY chapter_index DESC LIMIT 5
   `).all(projectId, chapterIndex) as Array<Record<string, unknown>>
 
@@ -1504,7 +1575,8 @@ export function queryStateAtChapter(
       plantedMethod: String(row.planted_method ?? ''),
       payoffChapter: row.payoff_chapter != null ? Number(row.payoff_chapter) : null,
       resolvedChapter: row.resolved_chapter != null ? Number(row.resolved_chapter) : null,
-      clues: parseJson<Foreshadowing['clues']>(row.clues_json, []),
+      clues: parseJson<Foreshadowing['clues']>(row.clues_json, [])
+        .filter((clue) => clue.chapter <= chapterIndex),
       connections: parseJson<string[]>(row.connections_json, [])
     })),
     relationships: getRelationshipsAtChapter(db, projectId, chapterIndex, allIds),
@@ -1528,7 +1600,7 @@ export function listActiveEvidenceRefs(
   const rows = db.prepare(`
     SELECT id, source_type, source_id, chapter_index, content_hash, valid_until_chapter
     FROM story_embeddings
-    WHERE project_id = ?
+    WHERE project_id = ? AND invalidated_at IS NULL
       AND invalidated_at IS NULL
       AND (chapter_index IS NULL OR chapter_index <= ?)
       AND (valid_until_chapter IS NULL OR valid_until_chapter >= ?)

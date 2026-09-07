@@ -391,6 +391,16 @@ test('回到任意章点会失效下游派生状态并保留正文与版本', ()
   assert.equal(listChaptersNeedingResettlement(db, 'p')[0].chapterId, 'c2')
   assert.equal(db.prepare("SELECT COUNT(*) count FROM chapters WHERE project_id='p'").get().count, 3)
   assert.equal(db.prepare("SELECT COUNT(*) count FROM chapter_versions WHERE project_id='p'").get().count, 3)
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM story_character_state WHERE project_id='p'").get().count, 3)
+  assert.ok(db.prepare(`
+    SELECT invalidated_at FROM story_character_state
+    WHERE project_id = 'p' AND valid_from_chapter = 2
+  `).get().invalidated_at)
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM story_timeline WHERE project_id='p'").get().count, 3)
+  assert.ok(db.prepare(`
+    SELECT invalidated_at FROM story_timeline
+    WHERE project_id = 'p' AND chapter_index = 2
+  `).get().invalidated_at)
   assert.ok(db.prepare("SELECT invalidated_at FROM settlement_runs WHERE id='run-2'").get().invalidated_at)
   assert.equal(db.prepare("SELECT valid FROM chapter_summaries WHERE project_id='p' AND chapter_index=2").get().valid, 0)
 })
@@ -416,6 +426,29 @@ test('过期回溯计划在写入前被 CAS 拒绝', () => {
 
   assert.throws(() => applyRollbackPlan(db, plan), /STALE_BASE_VERSION/)
   assert.equal(getLatestCharacterStates(db, 'p', ['林岚'])[0].location, 'C')
+})
+
+test('应用回溯时忽略客户端篡改的保留章节列表并在事务内重算', () => {
+  const db = makeRollbackDb()
+  const plan = { ...planRollbackToChapter(db, 'p', 1), retainedChapterIds: [] }
+
+  applyRollbackPlan(db, plan)
+
+  assert.deepEqual(
+    listChaptersNeedingResettlement(db, 'p').map((item) => item.chapterId),
+    ['c2']
+  )
+})
+
+test('越界回溯目标被拒绝且不改变账本或状态', () => {
+  const db = makeRollbackDb()
+  const before = readProjectLedger(db, 'p')
+  const plan = { ...planRollbackToChapter(db, 'p', 1), targetChapter: 99 }
+
+  assert.throws(() => applyRollbackPlan(db, plan), /TARGET_CHAPTER_OUT_OF_RANGE/)
+  assert.deepEqual(readProjectLedger(db, 'p'), before)
+  assert.equal(getLatestCharacterStates(db, 'p', ['林岚'])[0].location, 'C')
+  assert.equal(listChaptersNeedingResettlement(db, 'p').length, 0)
 })
 
 test('P7.1 快照回滚 closure：跨章关门后回滚恢复当前行', () => {

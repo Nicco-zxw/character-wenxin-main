@@ -268,7 +268,7 @@ test('P7.1 旧库迁移：补 closure 列 + 重建索引 + valid_from 回填 + �
   assert.equal(getCharacterStateAtChapter(db, 'p', '林岚', 4).location, '旧港')
   // 版本升 2 且留痕
   assert.equal(readLedgerValue(db, 'schema_version'), TRUTH_LEDGER_SCHEMA_VERSION)
-  assert.ok(readLedgerValue(db, 'migration').includes('-> 3'))
+  assert.ok(readLedgerValue(db, 'migration').includes('-> 4'))
   // 迁移后可正常 closure 写读
   applyStateDelta(db, 'p', 5, mkDelta('更远处'))
   assert.equal(getLatestCharacterStates(db, 'p', ['林岚'])[0].location, '更远处')
@@ -525,7 +525,7 @@ test('B1 旧库迁移：关系补 closure 列 + 重建当前索引 + valid_from 
   assert.equal(row.valid_from_chapter, 2)
   assert.equal(row.valid_until_chapter, null)
   assert.equal(readLedgerValue(db, 'schema_version'), TRUTH_LEDGER_SCHEMA_VERSION)
-  assert.ok(readLedgerValue(db, 'migration').includes('-> 3'))
+  assert.ok(readLedgerValue(db, 'migration').includes('-> 4'))
   // 迁移后可正常 closure 写读
   applyStateDelta(db, 'p', 5, relDelta('r-AB', ['A', 'B'], '深交'))
   assert.equal(getRelationshipsAtChapter(db, 'p', 2)[0].currentStatus, '相识')

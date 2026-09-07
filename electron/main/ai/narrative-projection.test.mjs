@@ -15,7 +15,11 @@ function makeDbWithOneSettledChapter() {
   applyStateDelta(db, 'p', 0, {
     characters_updated: [{ character_id: '林岚', changes: { mental_state: '警觉' } }],
     relationships_delta: [],
-    foreshadowing_delta: { planted: [], advanced: [], resolved: [] },
+    foreshadowing_delta: {
+      planted: [{ id: '伏笔-1', type: '物件', description: '旧信', method: '露出', payoff_chapter: 5 }],
+      advanced: [],
+      resolved: []
+    },
     timeline: {
       story_time_elapsed: '',
       current_story_date: '第一日',
@@ -45,7 +49,11 @@ test('历史章投影不会包含未来章节事实', () => {
   applyStateDelta(db, 'p', 2, {
     characters_updated: [{ character_id: '林岚', changes: { mental_state: '释然' } }],
     relationships_delta: [],
-    foreshadowing_delta: { planted: [], advanced: [], resolved: [] },
+    foreshadowing_delta: {
+      planted: [],
+      advanced: [{ id: '伏笔-1', clue: '火漆来自王府', method: '辨认' }],
+      resolved: []
+    },
     timeline: {
       story_time_elapsed: '',
       current_story_date: '第三日',
@@ -59,4 +67,5 @@ test('历史章投影不会包含未来章节事实', () => {
   )
   assert.equal(parsed.snapshot.truth.characterStates[0].mentalState, '警觉')
   assert.deepEqual(parsed.snapshot.truth.recentTimeline[0].events, ['林岚发现异响'])
+  assert.deepEqual(parsed.snapshot.truth.activeForeshadowing[0].clues, [])
 })
