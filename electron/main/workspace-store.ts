@@ -13,16 +13,17 @@ import {
   normalizeProjectRecord,
   normalizeWorkspacePayload
 } from './workspace-types'
-import { initStoryStateSchema } from './story-state-store'
 import { initAssistantRuntimeSchema } from './ai/runtime-v2/conversation-manager'
 import { initChapterProcessingSchema } from './ai/runtime/chapter-processing-store'
 import { initStateBackfillSchema } from './ai/state-backfill-store'
-import { initSettlementSchema } from './ai/settlement/settlement-store'
-import { initBookLockSchema } from './ai/locking/book-lock'
 import { initForecastSchema } from './ai/forecast/store'
 import { initAgentProfileSchema } from './ai/agent-profile-store'
 import { initContextTraceSchema } from './ai/context-trace'
 import { migrateKnowledgeDocumentScopes } from './knowledge-document-schema'
+import {
+  ensureNarrativeMigrationBackup,
+  runNarrativeMigrations
+} from './narrative-migration'
 
 const WORKSPACE_DB = 'workspace.db'
 const WORKSPACE_FILE = 'workspace.json'
@@ -45,9 +46,14 @@ function getWorkspaceDbPath(): string {
 
 let workspaceDb: DatabaseSync | null = null
 let dbInitPromise: Promise<DatabaseSync> | null = null
+let workspaceRecoveryState: { readOnly: true; reason: string; backupPath: string | null } | null = null
 
 export function getWorkspaceDbIfInitialized(): DatabaseSync | null {
   return workspaceDb
+}
+
+export function getWorkspaceRecoveryState(): typeof workspaceRecoveryState {
+  return workspaceRecoveryState
 }
 
 async function ensureWorkspaceDir(): Promise<void> {
@@ -61,7 +67,10 @@ export async function ensureWorkspaceDb(): Promise<DatabaseSync> {
   dbInitPromise = (async () => {
     try {
     await ensureWorkspaceDir()
-    const db = new DatabaseSync(getWorkspaceDbPath())
+    const workspaceDir = getWorkspaceDirPath()
+    const databasePath = getWorkspaceDbPath()
+    const backupPath = await ensureNarrativeMigrationBackup(workspaceDir)
+    const db = new DatabaseSync(databasePath)
     db.exec(`
     PRAGMA foreign_keys = ON;
 
@@ -367,12 +376,22 @@ export async function ensureWorkspaceDb(): Promise<DatabaseSync> {
   ensureVolumeColumns(db)
   ensureWorkflowDocumentColumns(db)
   ensureKnowledgeDocumentSchema(db)
-  initStoryStateSchema(db)
+  try {
+    runNarrativeMigrations(db)
+  } catch (error) {
+    db.close()
+    const readOnlyDb = new DatabaseSync(databasePath, { readOnly: true })
+    workspaceRecoveryState = {
+      readOnly: true,
+      reason: error instanceof Error ? error.message : String(error),
+      backupPath
+    }
+    workspaceDb = readOnlyDb
+    return readOnlyDb
+  }
   initAssistantRuntimeSchema(db)
   initChapterProcessingSchema(db)
   initStateBackfillSchema(db)
-  initSettlementSchema(db)
-  initBookLockSchema(db)
   initForecastSchema(db)
   initContextTraceSchema(db)
   initAgentProfileSchema(db)
