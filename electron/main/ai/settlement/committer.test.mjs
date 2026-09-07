@@ -90,6 +90,11 @@ test('基础账本版本过期时拒绝提交', () => {
 
 test('成功提交一次性推进状态、摘要、账本版本与结算记录', () => {
   const db = makeDb()
+  db.prepare(`
+    INSERT INTO chapter_resettlement_queue
+      (project_id, chapter_id, chapter_index, reason, created_at, resolved_at)
+    VALUES ('p', 'c1', 1, '回溯后重结算', '2026-09-07T00:00:00.000Z', NULL)
+  `).run()
   const result = commitSettlement(db, input)
 
   assert.deepEqual(result, { runId: 'run-atomic', committedLedgerVersion: 1 })
@@ -98,4 +103,8 @@ test('成功提交一次性推进状态、摘要、账本版本与结算记录',
   const run = readSettlementRun(db, 'p', 'c1', 1)
   assert.equal(run?.baseLedgerVersion, 0)
   assert.equal(run?.committedLedgerVersion, 1)
+  assert.ok(db.prepare(`
+    SELECT resolved_at FROM chapter_resettlement_queue
+    WHERE project_id = 'p' AND chapter_id = 'c1'
+  `).get().resolved_at)
 })

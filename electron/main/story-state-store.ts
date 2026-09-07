@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite'
+import type { RollbackPlan } from '../shared/narrative-memory.ts'
 
 // ==================== Types ====================
 
@@ -417,6 +418,7 @@ const STORY_STATE_SCHEMA = `
     embedding BLOB NOT NULL,
     content_hash TEXT,
     valid_until_chapter INTEGER,
+    invalidated_at TEXT,
     created_at TEXT NOT NULL
   ) STRICT;
 
@@ -451,8 +453,29 @@ const STORY_STATE_SCHEMA = `
     state_changes_json TEXT NOT NULL DEFAULT '[]',
     hook_activity_json TEXT NOT NULL DEFAULT '{}',
     source_event_id TEXT,
+    valid INTEGER NOT NULL DEFAULT 1,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (project_id, chapter_index)
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS chapter_resettlement_queue (
+    project_id TEXT NOT NULL,
+    chapter_id TEXT NOT NULL,
+    chapter_index INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    PRIMARY KEY (project_id, chapter_id)
+  ) STRICT;
+
+  CREATE TABLE IF NOT EXISTS narrative_rollback_events (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    target_chapter INTEGER NOT NULL,
+    base_ledger_version INTEGER NOT NULL,
+    committed_ledger_version INTEGER NOT NULL,
+    invalidated_chapters_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
   ) STRICT;
 `
 
@@ -526,6 +549,8 @@ export function initStoryStateSchema(db: DatabaseSync): void {
   // P7.5：向量索引版本/生效列（content_hash=所索引文本版本；valid_until 预留 closure 生效区间，NULL=当前）
   ensureColumn(db, 'story_embeddings', 'content_hash', 'content_hash TEXT')
   ensureColumn(db, 'story_embeddings', 'valid_until_chapter', 'valid_until_chapter INTEGER')
+  ensureColumn(db, 'story_embeddings', 'invalidated_at', 'invalidated_at TEXT')
+  ensureColumn(db, 'chapter_summaries', 'valid', 'valid INTEGER NOT NULL DEFAULT 1')
 
   if (STORY_STATE_CLOSURE_ENABLED) {
     // ── 存量规范化（幂等；必须在建「当前行部分唯一」索引之前）──
@@ -666,6 +691,227 @@ export function bumpProjectLedger(
       updated_at = excluded.updated_at
   `).run(projectId, input.settledThroughChapter, timestamp)
   return readProjectLedger(db, projectId).ledgerVersion
+}
+
+export interface ChapterResettlementItem {
+  projectId: string
+  chapterId: string
+  chapterIndex: number
+  reason: string
+  createdAt: string
+  resolvedAt: string | null
+}
+
+export interface RollbackApplyHooks {
+  afterState?(): void
+  afterInvalidation?(): void
+  afterQueue?(): void
+}
+
+/** 只读预览回溯影响；正文 ID 来自 chapters 的稳定顺序，不修改任何表。 */
+export function planRollbackToChapter(
+  db: DatabaseSync,
+  projectId: string,
+  targetChapter: number
+): RollbackPlan {
+  const invalidatedRows = db.prepare(`
+    SELECT DISTINCT chapter_index
+    FROM settlement_runs
+    WHERE project_id = ? AND chapter_index > ?
+      AND status IN ('settled', 'settled_with_warning')
+      AND invalidated_at IS NULL
+    ORDER BY chapter_index ASC
+  `).all(projectId, targetChapter) as Array<{ chapter_index: number }>
+  const invalidatedChapters = invalidatedRows.map((row) => Number(row.chapter_index))
+  const chapterRows = db.prepare(`
+    SELECT id FROM chapters WHERE project_id = ?
+    ORDER BY sort_order ASC, rowid ASC
+  `).all(projectId) as Array<{ id: string }>
+
+  return {
+    projectId,
+    targetChapter,
+    invalidatedChapters,
+    retainedChapterIds: chapterRows.slice(targetChapter + 1).map((row) => String(row.id)),
+    baseLedgerVersion: readProjectLedger(db, projectId).ledgerVersion
+  }
+}
+
+/** 读取尚未重新结算的保留章节。 */
+export function listChaptersNeedingResettlement(
+  db: DatabaseSync,
+  projectId: string
+): ChapterResettlementItem[] {
+  const rows = db.prepare(`
+    SELECT * FROM chapter_resettlement_queue
+    WHERE project_id = ? AND resolved_at IS NULL
+    ORDER BY chapter_index ASC
+  `).all(projectId) as Array<Record<string, unknown>>
+  return rows.map((row) => ({
+    projectId: String(row.project_id),
+    chapterId: String(row.chapter_id),
+    chapterIndex: Number(row.chapter_index),
+    reason: String(row.reason),
+    createdAt: String(row.created_at),
+    resolvedAt: row.resolved_at == null ? null : String(row.resolved_at)
+  }))
+}
+
+function sqliteTableExists(db: DatabaseSync, table: string): boolean {
+  return db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(table) != null
+}
+
+/** 原子应用回溯计划；仅失效派生状态，绝不删除章节正文及版本历史。 */
+export function applyRollbackPlan(
+  db: DatabaseSync,
+  plan: RollbackPlan,
+  hooks: RollbackApplyHooks = {}
+): { ledgerVersion: number; invalidatedChapters: number[] } {
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    const current = readProjectLedger(db, plan.projectId)
+    if (current.ledgerVersion !== plan.baseLedgerVersion) {
+      throw new Error(
+        `STALE_BASE_VERSION: expected ${plan.baseLedgerVersion}, received ${current.ledgerVersion}`
+      )
+    }
+
+    db.prepare('DELETE FROM story_character_state WHERE project_id = ? AND valid_from_chapter > ?')
+      .run(plan.projectId, plan.targetChapter)
+    db.prepare(`
+      UPDATE story_character_state AS current
+      SET valid_until_chapter = NULL
+      WHERE current.project_id = ? AND current.valid_from_chapter <= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM story_character_state newer
+          WHERE newer.project_id = current.project_id
+            AND newer.character_id = current.character_id
+            AND newer.valid_from_chapter <= ?
+            AND newer.valid_from_chapter > current.valid_from_chapter
+        )
+    `).run(plan.projectId, plan.targetChapter, plan.targetChapter)
+    db.prepare('DELETE FROM story_relationships WHERE project_id = ? AND valid_from_chapter > ?')
+      .run(plan.projectId, plan.targetChapter)
+    db.prepare(`
+      UPDATE story_relationships AS current
+      SET valid_until_chapter = NULL
+      WHERE current.project_id = ? AND current.valid_from_chapter <= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM story_relationships newer
+          WHERE newer.project_id = current.project_id
+            AND newer.relationship_id = current.relationship_id
+            AND newer.valid_from_chapter <= ?
+            AND newer.valid_from_chapter > current.valid_from_chapter
+        )
+    `).run(plan.projectId, plan.targetChapter, plan.targetChapter)
+    db.prepare('DELETE FROM story_timeline WHERE project_id = ? AND chapter_index > ?')
+      .run(plan.projectId, plan.targetChapter)
+    db.prepare('DELETE FROM story_world_rules WHERE project_id = ? AND established_chapter > ?')
+      .run(plan.projectId, plan.targetChapter)
+
+    db.prepare('DELETE FROM story_foreshadowing WHERE project_id = ? AND planted_chapter > ?')
+      .run(plan.projectId, plan.targetChapter)
+    const foreshadowRows = db.prepare(`
+      SELECT foreshadowing_id, status, resolved_chapter, clues_json
+      FROM story_foreshadowing WHERE project_id = ?
+    `).all(plan.projectId) as Array<Record<string, unknown>>
+    for (const row of foreshadowRows) {
+      const clues = parseJson<Array<{ chapter: number; clue: string; method: string }>>(row.clues_json, [])
+        .filter((clue) => Number(clue.chapter) <= plan.targetChapter)
+      const resolvedChapter = row.resolved_chapter == null ? null : Number(row.resolved_chapter)
+      const resolutionInvalid = resolvedChapter != null && resolvedChapter > plan.targetChapter
+      const status = resolutionInvalid
+        ? (clues.length ? 'advanced' : 'active')
+        : String(row.status)
+      db.prepare(`
+        UPDATE story_foreshadowing
+        SET clues_json = ?, status = ?, resolved_chapter = ?, source_event_id = NULL,
+            actor = 'rollback', updated_at = ?
+        WHERE project_id = ? AND foreshadowing_id = ?
+      `).run(
+        JSON.stringify(clues),
+        status,
+        resolutionInvalid ? null : resolvedChapter,
+        now(),
+        plan.projectId,
+        String(row.foreshadowing_id)
+      )
+    }
+    hooks.afterState?.()
+
+    const rollbackId = `rollback-${uid()}`
+    const timestamp = now()
+    db.prepare(`
+      UPDATE settlement_runs SET invalidated_at = ?, invalidated_by_run_id = ?
+      WHERE project_id = ? AND chapter_index > ? AND invalidated_at IS NULL
+    `).run(timestamp, rollbackId, plan.projectId, plan.targetChapter)
+    db.prepare(`
+      UPDATE chapter_summaries SET valid = 0
+      WHERE project_id = ? AND chapter_index > ?
+    `).run(plan.projectId, plan.targetChapter)
+    db.prepare(`
+      UPDATE story_embeddings SET invalidated_at = ?
+      WHERE project_id = ? AND chapter_index > ? AND invalidated_at IS NULL
+    `).run(timestamp, plan.projectId, plan.targetChapter)
+    if (sqliteTableExists(db, 'narrative_forecasts')) {
+      db.prepare(`
+        UPDATE narrative_forecasts SET status = 'expired', updated_at = ?
+        WHERE project_id = ? AND base_chapter_index > ? AND status != 'expired'
+      `).run(timestamp, plan.projectId, plan.targetChapter)
+    }
+    hooks.afterInvalidation?.()
+
+    const chapters = db.prepare(`
+      SELECT id FROM chapters WHERE project_id = ?
+      ORDER BY sort_order ASC, rowid ASC
+    `).all(plan.projectId) as Array<{ id: string }>
+    const retained = new Set(plan.retainedChapterIds)
+    const queue = db.prepare(`
+      INSERT INTO chapter_resettlement_queue
+        (project_id, chapter_id, chapter_index, reason, created_at, resolved_at)
+      VALUES (?, ?, ?, ?, ?, NULL)
+      ON CONFLICT(project_id, chapter_id) DO UPDATE SET
+        chapter_index = excluded.chapter_index,
+        reason = excluded.reason,
+        created_at = excluded.created_at,
+        resolved_at = NULL
+    `)
+    chapters.forEach((chapter, chapterIndex) => {
+      if (chapterIndex > plan.targetChapter && retained.has(chapter.id)) {
+        queue.run(
+          plan.projectId,
+          chapter.id,
+          chapterIndex,
+          `回溯至第 ${plan.targetChapter} 章后需重新结算`,
+          timestamp
+        )
+      }
+    })
+    hooks.afterQueue?.()
+
+    const ledgerVersion = bumpProjectLedger(db, plan.projectId, {
+      settledThroughChapter: plan.targetChapter
+    })
+    db.prepare(`
+      INSERT INTO narrative_rollback_events
+        (id, project_id, target_chapter, base_ledger_version, committed_ledger_version,
+         invalidated_chapters_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      rollbackId,
+      plan.projectId,
+      plan.targetChapter,
+      plan.baseLedgerVersion,
+      ledgerVersion,
+      JSON.stringify(plan.invalidatedChapters),
+      timestamp
+    )
+    db.exec('COMMIT')
+    return { ledgerVersion, invalidatedChapters: [...plan.invalidatedChapters] }
+  } catch (error) {
+    db.exec('ROLLBACK')
+    throw error
+  }
 }
 
 /** 行 → CharacterState（读路径统一映射）。 */
@@ -1283,6 +1529,7 @@ export function listActiveEvidenceRefs(
     SELECT id, source_type, source_id, chapter_index, content_hash, valid_until_chapter
     FROM story_embeddings
     WHERE project_id = ?
+      AND invalidated_at IS NULL
       AND (chapter_index IS NULL OR chapter_index <= ?)
       AND (valid_until_chapter IS NULL OR valid_until_chapter >= ?)
     ORDER BY source_type ASC, source_id ASC, id ASC
@@ -1393,8 +1640,8 @@ export function upsertChapterSummary(
   db.prepare(`
     INSERT INTO chapter_summaries (
       project_id, chapter_index, title, characters_json, events_json,
-      state_changes_json, hook_activity_json, source_event_id, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      state_changes_json, hook_activity_json, source_event_id, valid, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
     ON CONFLICT(project_id, chapter_index) DO UPDATE SET
       title = excluded.title,
       characters_json = excluded.characters_json,
@@ -1402,6 +1649,7 @@ export function upsertChapterSummary(
       state_changes_json = excluded.state_changes_json,
       hook_activity_json = excluded.hook_activity_json,
       source_event_id = excluded.source_event_id,
+      valid = 1,
       updated_at = excluded.updated_at
   `).run(
     projectId, chapterIndex, input.title,
@@ -1443,7 +1691,7 @@ export function readChapterSummary(
   projectId: string,
   chapterIndex: number
 ): ChapterSummary | null {
-  const row = db.prepare('SELECT * FROM chapter_summaries WHERE project_id = ? AND chapter_index = ?')
+  const row = db.prepare('SELECT * FROM chapter_summaries WHERE project_id = ? AND chapter_index = ? AND valid = 1')
     .get(projectId, chapterIndex) as Record<string, unknown> | undefined
   return row ? rowToChapterSummary(row) : null
 }
@@ -1455,7 +1703,7 @@ export function listChapterSummaries(
   limit = 50
 ): ChapterSummary[] {
   const rows = db.prepare(`
-    SELECT * FROM chapter_summaries WHERE project_id = ?
+    SELECT * FROM chapter_summaries WHERE project_id = ? AND valid = 1
     ORDER BY chapter_index DESC LIMIT ?
   `).all(projectId, limit) as Array<Record<string, unknown>>
   return rows.map((row) => rowToChapterSummary(row))

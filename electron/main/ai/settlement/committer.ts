@@ -104,6 +104,12 @@ export function commitSettlement(
       baseLedgerVersion: input.baseLedgerVersion,
       committedLedgerVersion
     })
+    if (input.chapterId) {
+      db.prepare(`
+        UPDATE chapter_resettlement_queue SET resolved_at = ?
+        WHERE project_id = ? AND chapter_id = ? AND resolved_at IS NULL
+      `).run(new Date().toISOString(), input.projectId, input.chapterId)
+    }
 
     db.exec('COMMIT')
     return { runId: input.runId, committedLedgerVersion }

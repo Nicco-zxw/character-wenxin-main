@@ -33,6 +33,8 @@ const SETTLEMENT_SCHEMA = `
     trace_id TEXT,
     base_ledger_version INTEGER NOT NULL DEFAULT 0,
     committed_ledger_version INTEGER,
+    invalidated_at TEXT,
+    invalidated_by_run_id TEXT,
     created_at TEXT NOT NULL
   ) STRICT;
 
@@ -106,6 +108,8 @@ export function initSettlementSchema(db: DatabaseSync): void {
   ensureColumn(db, 'settlement_runs', 'trace_id', 'trace_id TEXT')
   ensureColumn(db, 'settlement_runs', 'base_ledger_version', 'base_ledger_version INTEGER NOT NULL DEFAULT 0')
   ensureColumn(db, 'settlement_runs', 'committed_ledger_version', 'committed_ledger_version INTEGER')
+  ensureColumn(db, 'settlement_runs', 'invalidated_at', 'invalidated_at TEXT')
+  ensureColumn(db, 'settlement_runs', 'invalidated_by_run_id', 'invalidated_by_run_id TEXT')
   ensureColumn(db, 'settlement_snapshots', 'source_event_id', 'source_event_id TEXT')
 }
 
@@ -264,6 +268,7 @@ export function hasSettledContent(
     SELECT id FROM settlement_runs
     WHERE project_id = ? AND chapter_index = ? AND content_hash = ?
       AND status IN ('settled', 'settled_with_warning')
+      AND invalidated_at IS NULL
     LIMIT 1
   `).get(projectId, chapterIndex, contentHash)
   return row != null
@@ -274,6 +279,7 @@ export function latestSettledChapterIndex(db: DatabaseSync, projectId: string): 
   const row = db.prepare(`
     SELECT MAX(chapter_index) AS max_ch FROM settlement_runs
     WHERE project_id = ? AND status IN ('settled', 'settled_with_warning')
+      AND invalidated_at IS NULL
   `).get(projectId) as { max_ch: number | null }
   return row.max_ch == null ? null : Number(row.max_ch)
 }

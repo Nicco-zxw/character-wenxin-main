@@ -3,11 +3,18 @@ import { DatabaseSync } from 'node:sqlite'
 import test from 'node:test'
 
 import {
+  applyRollbackPlan,
   applyStateDelta,
+  bumpProjectLedger,
   getActiveForeshadowing,
   getLatestCharacterStates,
   getRelationships,
-  initStoryStateSchema
+  initStoryStateSchema,
+  listChaptersNeedingResettlement,
+  planRollbackToChapter,
+  queryStateAtChapter,
+  readProjectLedger,
+  summarizeChapterAfterSettlement
 } from '../../story-state-store.ts'
 import {
   clearSettlementSnapshots,
@@ -317,6 +324,8 @@ test('P7.0 旧库迁移：缺列时 initSettlementSchema 幂等补列并兼容�
   assert.ok(runCols.includes('trace_id'))
   assert.ok(runCols.includes('base_ledger_version'))
   assert.ok(runCols.includes('committed_ledger_version'))
+  assert.ok(runCols.includes('invalidated_at'))
+  assert.ok(runCols.includes('invalidated_by_run_id'))
   assert.ok(snapCols.includes('source_event_id'))
   // 幂等：再跑一次不抛错、列仍在
   initSettlementSchema(db)
@@ -331,6 +340,82 @@ test('P7.0 旧库迁移：缺列时 initSettlementSchema 幂等补列并兼容�
   assert.equal(rec.traceId, 'tr-x')
   assert.equal(rec.baseLedgerVersion, 0)
   assert.equal(rec.committedLedgerVersion, null)
+})
+
+function makeRollbackDb() {
+  const db = makeDb()
+  db.exec(`
+    CREATE TABLE chapters (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL, title TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL DEFAULT '', sort_order INTEGER NOT NULL DEFAULT 0
+    ) STRICT;
+    CREATE TABLE chapter_versions (
+      id TEXT PRIMARY KEY, project_id TEXT NOT NULL, chapter_id TEXT NOT NULL,
+      content TEXT NOT NULL DEFAULT ''
+    ) STRICT;
+  `)
+  for (let chapterIndex = 0; chapterIndex < 3; chapterIndex += 1) {
+    const chapterId = `c${chapterIndex}`
+    db.prepare('INSERT INTO chapters (id, project_id, title, content, sort_order) VALUES (?, ?, ?, ?, ?)')
+      .run(chapterId, 'p', `第${chapterIndex + 1}章`, `正文${chapterIndex}`, chapterIndex)
+    db.prepare('INSERT INTO chapter_versions (id, project_id, chapter_id, content) VALUES (?, ?, ?, ?)')
+      .run(`v${chapterIndex}`, 'p', chapterId, `旧正文${chapterIndex}`)
+    const delta = charDelta('林岚', {
+      from: chapterIndex === 0 ? '' : String.fromCharCode(64 + chapterIndex),
+      to: String.fromCharCode(65 + chapterIndex)
+    })
+    applyStateDelta(db, 'p', chapterIndex, delta)
+    summarizeChapterAfterSettlement(db, 'p', chapterIndex, delta, `run-${chapterIndex}`)
+    const baseLedgerVersion = readProjectLedger(db, 'p').ledgerVersion
+    const committedLedgerVersion = bumpProjectLedger(db, 'p', { settledThroughChapter: chapterIndex })
+    recordSettlementRun(db, {
+      id: `run-${chapterIndex}`, projectId: 'p', chapterId, chapterIndex,
+      contentHash: `hash-${chapterIndex}`, attempt: 0, status: 'settled', decision: 'apply',
+      issues: [], delta, reason: 'ok', baseLedgerVersion, committedLedgerVersion
+    })
+  }
+  return db
+}
+
+test('回到任意章点会失效下游派生状态并保留正文与版本', () => {
+  const db = makeRollbackDb()
+  const plan = planRollbackToChapter(db, 'p', 1)
+  assert.deepEqual(plan.invalidatedChapters, [2])
+  assert.deepEqual(plan.retainedChapterIds, ['c2'])
+
+  const result = applyRollbackPlan(db, plan)
+  assert.deepEqual(result.invalidatedChapters, [2])
+  assert.equal(queryStateAtChapter(db, 'p', 1).characterStates[0].location, 'B')
+  assert.equal(getLatestCharacterStates(db, 'p', ['林岚'])[0].location, 'B')
+  assert.equal(readProjectLedger(db, 'p').settledThroughChapter, 1)
+  assert.equal(listChaptersNeedingResettlement(db, 'p')[0].chapterId, 'c2')
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM chapters WHERE project_id='p'").get().count, 3)
+  assert.equal(db.prepare("SELECT COUNT(*) count FROM chapter_versions WHERE project_id='p'").get().count, 3)
+  assert.ok(db.prepare("SELECT invalidated_at FROM settlement_runs WHERE id='run-2'").get().invalidated_at)
+  assert.equal(db.prepare("SELECT valid FROM chapter_summaries WHERE project_id='p' AND chapter_index=2").get().valid, 0)
+})
+
+test('回溯阶段故障会回滚状态、失效标记、队列和账本版本', () => {
+  const db = makeRollbackDb()
+  const plan = planRollbackToChapter(db, 'p', 1)
+
+  assert.throws(
+    () => applyRollbackPlan(db, plan, { afterState: () => { throw new Error('rollback-injected') } }),
+    /rollback-injected/
+  )
+  assert.equal(getLatestCharacterStates(db, 'p', ['林岚'])[0].location, 'C')
+  assert.equal(readProjectLedger(db, 'p').ledgerVersion, 3)
+  assert.equal(db.prepare('SELECT COUNT(*) count FROM chapter_resettlement_queue').get().count, 0)
+  assert.equal(db.prepare('SELECT invalidated_at FROM settlement_runs WHERE id = ?').get('run-2').invalidated_at, null)
+})
+
+test('过期回溯计划在写入前被 CAS 拒绝', () => {
+  const db = makeRollbackDb()
+  const plan = planRollbackToChapter(db, 'p', 1)
+  bumpProjectLedger(db, 'p', { settledThroughChapter: 2 })
+
+  assert.throws(() => applyRollbackPlan(db, plan), /STALE_BASE_VERSION/)
+  assert.equal(getLatestCharacterStates(db, 'p', ['林岚'])[0].location, 'C')
 })
 
 test('P7.1 快照回滚 closure：跨章关门后回滚恢复当前行', () => {
