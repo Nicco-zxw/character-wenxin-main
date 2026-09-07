@@ -31,6 +31,8 @@ const SETTLEMENT_SCHEMA = `
     reason TEXT NOT NULL DEFAULT '',
     actor TEXT NOT NULL DEFAULT 'observer',
     trace_id TEXT,
+    base_ledger_version INTEGER NOT NULL DEFAULT 0,
+    committed_ledger_version INTEGER,
     created_at TEXT NOT NULL
   ) STRICT;
 
@@ -102,6 +104,8 @@ export function initSettlementSchema(db: DatabaseSync): void {
   // 兼容迁移：为既有库补 P7.0 新增的审计维度列（幂等）
   ensureColumn(db, 'settlement_runs', 'actor', "actor TEXT NOT NULL DEFAULT 'observer'")
   ensureColumn(db, 'settlement_runs', 'trace_id', 'trace_id TEXT')
+  ensureColumn(db, 'settlement_runs', 'base_ledger_version', 'base_ledger_version INTEGER NOT NULL DEFAULT 0')
+  ensureColumn(db, 'settlement_runs', 'committed_ledger_version', 'committed_ledger_version INTEGER')
   ensureColumn(db, 'settlement_snapshots', 'source_event_id', 'source_event_id TEXT')
 }
 
@@ -131,14 +135,19 @@ export function recordSettlementRun(
     actor?: SettlementActor
     /** 关联上下文 trace id（可空） */
     traceId?: string | null
+    /** 观察所基于的项目账本版本；旧调用默认 0。 */
+    baseLedgerVersion?: number
+    /** 成功提交后的项目账本版本；未落账时默认 null。 */
+    committedLedgerVersion?: number | null
   }
 ): string {
   const id = input.id ?? uid()
   db.prepare(`
     INSERT INTO settlement_runs (
       id, project_id, chapter_id, chapter_index, content_hash, attempt,
-      status, decision, issues_json, delta_json, reason, actor, trace_id, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      status, decision, issues_json, delta_json, reason, actor, trace_id,
+      base_ledger_version, committed_ledger_version, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     input.projectId,
@@ -153,6 +162,8 @@ export function recordSettlementRun(
     input.reason,
     input.actor ?? 'observer',
     input.traceId ?? null,
+    input.baseLedgerVersion ?? 0,
+    input.committedLedgerVersion ?? null,
     now()
   )
   return id
@@ -283,6 +294,10 @@ function rowToRecord(row: Record<string, unknown>): SettlementRunRecord {
     reason: String(row.reason ?? ''),
     actor: (row.actor as SettlementActor | undefined) ?? undefined,
     traceId: row.trace_id == null ? null : String(row.trace_id),
+    baseLedgerVersion: Number(row.base_ledger_version ?? 0),
+    committedLedgerVersion: row.committed_ledger_version == null
+      ? null
+      : Number(row.committed_ledger_version),
     createdAt: String(row.created_at ?? '')
   }
 }

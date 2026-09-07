@@ -62,6 +62,27 @@ test('settlementContentHash 对同一正文稳定、对不同正文不同', () =
   assert.notEqual(settlementContentHash('正文A'), settlementContentHash('正文B'))
 })
 
+test('结算记录保存基础与提交后账本版本', () => {
+  const db = makeDb()
+  recordSettlementRun(db, {
+    id: 'run-versioned',
+    projectId: 'p',
+    chapterIndex: 2,
+    contentHash: 'hash',
+    attempt: 0,
+    status: 'settled',
+    decision: 'apply',
+    issues: [],
+    delta: null,
+    reason: 'ok',
+    baseLedgerVersion: 4,
+    committedLedgerVersion: 5
+  })
+  const run = readSettlementRun(db, 'p', undefined, 2)
+  assert.equal(run?.baseLedgerVersion, 4)
+  assert.equal(run?.committedLedgerVersion, 5)
+})
+
 test('账本：记账 / 幂等命中 / 最新结算章 / 读取', () => {
   const db = makeDb()
   recordSettlementRun(db, {
@@ -294,6 +315,8 @@ test('P7.0 旧库迁移：缺列时 initSettlementSchema 幂等补列并兼容�
   const snapCols = db.prepare('PRAGMA table_info(settlement_snapshots)').all().map((c) => String(c.name))
   assert.ok(runCols.includes('actor'))
   assert.ok(runCols.includes('trace_id'))
+  assert.ok(runCols.includes('base_ledger_version'))
+  assert.ok(runCols.includes('committed_ledger_version'))
   assert.ok(snapCols.includes('source_event_id'))
   // 幂等：再跑一次不抛错、列仍在
   initSettlementSchema(db)
@@ -306,6 +329,8 @@ test('P7.0 旧库迁移：缺列时 initSettlementSchema 幂等补列并兼容�
   const rec = readSettlementRun(db, 'p', undefined, 0)
   assert.equal(rec.actor, 'backfill')
   assert.equal(rec.traceId, 'tr-x')
+  assert.equal(rec.baseLedgerVersion, 0)
+  assert.equal(rec.committedLedgerVersion, null)
 })
 
 test('P7.1 快照回滚 closure：跨章关门后回滚恢复当前行', () => {

@@ -139,6 +139,10 @@ export interface SettlementRunRecord {
   actor?: SettlementActor
   /** 关联的上下文 trace（P7.4 启用后填充），可空 */
   traceId?: string | null
+  /** 本次结算观察时读取的项目账本版本。 */
+  baseLedgerVersion: number
+  /** 成功提交后的项目账本版本；未落账时为空。 */
+  committedLedgerVersion: number | null
   createdAt: string
 }
 
