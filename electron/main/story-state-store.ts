@@ -295,6 +295,15 @@ export interface ProjectLedgerState {
   updatedAt: string
 }
 
+export interface ActiveEvidenceRef {
+  id: string
+  sourceType: string
+  sourceId: string
+  chapterIndex: number | null
+  contentHash: string | null
+  validUntilChapter: number | null
+}
+
 // ==================== Schema ====================
 
 const STORY_STATE_SCHEMA = `
@@ -1261,6 +1270,69 @@ export function queryStateAtChapter(
     })),
     worldRules: getWorldRules(db, projectId).filter((r) => r.establishedChapter <= chapterIndex),
     activeClocks: getActiveClocks(db, projectId)
+  }
+}
+
+/** 列出给定章点仍有效的证据索引引用，不暴露向量或正文副本。 */
+export function listActiveEvidenceRefs(
+  db: DatabaseSync,
+  projectId: string,
+  atChapter: number
+): ActiveEvidenceRef[] {
+  const rows = db.prepare(`
+    SELECT id, source_type, source_id, chapter_index, content_hash, valid_until_chapter
+    FROM story_embeddings
+    WHERE project_id = ?
+      AND (chapter_index IS NULL OR chapter_index <= ?)
+      AND (valid_until_chapter IS NULL OR valid_until_chapter >= ?)
+    ORDER BY source_type ASC, source_id ASC, id ASC
+  `).all(projectId, atChapter, atChapter) as Array<Record<string, unknown>>
+
+  return rows.map((row) => ({
+    id: String(row.id),
+    sourceType: String(row.source_type),
+    sourceId: String(row.source_id),
+    chapterIndex: row.chapter_index == null ? null : Number(row.chapter_index),
+    contentHash: row.content_hash == null ? null : String(row.content_hash),
+    validUntilChapter: row.valid_until_chapter == null ? null : Number(row.valid_until_chapter)
+  }))
+}
+
+/** 从 SQLite 真相账本构建五层叙事快照；JSON/Markdown 投影只能消费此结果。 */
+export function buildNarrativeSnapshot(
+  db: DatabaseSync,
+  projectId: string,
+  atChapter: number
+): {
+  constitution: Record<string, unknown>
+  truth: Record<string, unknown>
+  episodes: Record<string, unknown>
+  evidence: Record<string, unknown>
+  working: Record<string, unknown>
+} {
+  const truth = queryStateAtChapter(db, projectId, atChapter)
+  truth.characterStates.sort((a, b) => a.characterId.localeCompare(b.characterId))
+  truth.activeForeshadowing.sort((a, b) =>
+    a.plantedChapter - b.plantedChapter || a.foreshadowingId.localeCompare(b.foreshadowingId)
+  )
+  truth.relationships.sort((a, b) => a.relationshipId.localeCompare(b.relationshipId))
+  truth.recentTimeline.sort((a, b) => a.chapterIndex - b.chapterIndex)
+  truth.worldRules.sort((a, b) => a.establishedChapter - b.establishedChapter || a.ruleId.localeCompare(b.ruleId))
+  truth.activeClocks.sort((a, b) => a.clockId.localeCompare(b.clockId))
+
+  const worldRules = getWorldRules(db, projectId)
+    .filter((rule) => rule.establishedChapter <= atChapter)
+    .sort((a, b) => a.establishedChapter - b.establishedChapter || a.ruleId.localeCompare(b.ruleId))
+  const chapterSummaries = listChapterSummaries(db, projectId, 1_000_000)
+    .filter((summary) => summary.chapterIndex <= atChapter)
+    .sort((a, b) => a.chapterIndex - b.chapterIndex)
+
+  return {
+    constitution: { worldRules },
+    truth: { ...truth },
+    episodes: { chapterSummaries },
+    evidence: { indexedSources: listActiveEvidenceRefs(db, projectId, atChapter) },
+    working: {}
   }
 }
 
