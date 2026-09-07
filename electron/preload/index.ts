@@ -33,6 +33,12 @@ contextBridge.exposeInMainWorld('characterArc', {
   /** 将当前项目导出为 .carc 项目归档包 */
   exportProjectArchive: (payload: unknown) => ipcRenderer.invoke('characterarc:export-project-archive', toIpcPayload(payload)),
   truthExport: (projectId: string) => ipcRenderer.invoke('characterarc:truth-export', { projectId }),
+  truthExportV2: (payload: { projectId: string; atChapter: number; format: 'json' | 'markdown' }) =>
+    ipcRenderer.invoke('characterarc:truth-export-v2', toIpcPayload(payload)),
+  narrativeRollbackPreview: (payload: { projectId: string; targetChapter: number }) =>
+    ipcRenderer.invoke('characterarc:narrative-rollback-preview', toIpcPayload(payload)),
+  narrativeRollbackApply: (payload: unknown) =>
+    ipcRenderer.invoke('characterarc:narrative-rollback-apply', toIpcPayload(payload)),
   /** 选择并预览 .carc 项目归档包 */
   inspectProjectArchive: () => ipcRenderer.invoke('characterarc:inspect-project-archive'),
   /** 按指定模式导入 .carc 项目归档包 */

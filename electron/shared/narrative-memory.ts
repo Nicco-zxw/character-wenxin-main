@@ -40,3 +40,20 @@ export const RollbackPlanSchema = z.object({
   return { ...value, invalidatedChapters }
 })
 export type RollbackPlan = z.infer<typeof RollbackPlanSchema>
+
+const ChapterIndexSchema = z.number().finite()
+  .transform((value) => Math.floor(value))
+  .pipe(z.number().int().nonnegative())
+
+export const TruthExportRequestSchema = z.object({
+  projectId: z.string().trim().min(1),
+  atChapter: ChapterIndexSchema,
+  format: z.enum(['json', 'markdown'])
+}).strict()
+export type TruthExportRequest = z.infer<typeof TruthExportRequestSchema>
+
+export const RollbackPreviewRequestSchema = z.object({
+  projectId: z.string().trim().min(1),
+  targetChapter: ChapterIndexSchema
+}).strict()
+export type RollbackPreviewRequest = z.infer<typeof RollbackPreviewRequestSchema>

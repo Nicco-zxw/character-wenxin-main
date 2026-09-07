@@ -14,7 +14,17 @@ import { extractReferenceNovelContext, type ReferenceNovelLocalContext } from '.
 import { fetchWithCache } from './github-mirror'
 import { fetchFanqieTrends } from './fanqie-trends'
 import { getWorkspaceDirPath } from './workspace-store'
-import { buildTruthProjectionMarkdown } from './story-state-store'
+import {
+  applyRollbackPlan,
+  buildTruthProjectionMarkdown,
+  planRollbackToChapter
+} from './story-state-store'
+import { buildNarrativeProjection } from './ai/narrative-projection'
+import {
+  RollbackPlanSchema,
+  RollbackPreviewRequestSchema,
+  TruthExportRequestSchema
+} from '../shared/narrative-memory'
 import { inspectContinuationNovelFile } from './continuation-import'
 import {
   exportProjectArchive,
@@ -231,6 +241,51 @@ export function registerMainIpcHandlers(deps: RegisterMainIpcHandlersDeps): void
       canceled: false,
       filePath: result.filePath
     }
+  })
+
+  ipcMain.handle('characterarc:truth-export-v2', async (_event, payload: unknown) => {
+    const request = TruthExportRequestSchema.parse(payload)
+    const window = deps.windowManager.getActiveWindow()
+    if (!window) return { success: false, canceled: true }
+
+    const db = await deps.ensureWorkspaceDb()
+    const project = db.prepare('SELECT 1 FROM projects WHERE id = ?').get(request.projectId)
+    if (!project) throw new Error('PROJECT_NOT_FOUND')
+    const projection = buildNarrativeProjection(db, request.projectId, request.atChapter)
+    const isJson = request.format === 'json'
+    const result = await dialog.showSaveDialog(window, {
+      title: isJson ? '导出机器可读真相投影' : '导出人类可读真相投影',
+      defaultPath: `narrative-truth-chapter-${request.atChapter + 1}.${isJson ? 'json' : 'md'}`,
+      filters: [{
+        name: isJson ? 'JSON 文件' : 'Markdown 文件',
+        extensions: [isJson ? 'json' : 'md']
+      }]
+    })
+    if (result.canceled || !result.filePath) {
+      return { success: false, canceled: true }
+    }
+    await writeFile(
+      result.filePath,
+      isJson ? projection.json : projection.markdown,
+      'utf-8'
+    )
+    return { success: true, canceled: false, filePath: result.filePath }
+  })
+
+  ipcMain.handle('characterarc:narrative-rollback-preview', async (_event, payload: unknown) => {
+    const request = RollbackPreviewRequestSchema.parse(payload)
+    const db = await deps.ensureWorkspaceDb()
+    const project = db.prepare('SELECT 1 FROM projects WHERE id = ?').get(request.projectId)
+    if (!project) throw new Error('PROJECT_NOT_FOUND')
+    return planRollbackToChapter(db, request.projectId, request.targetChapter)
+  })
+
+  ipcMain.handle('characterarc:narrative-rollback-apply', async (_event, payload: unknown) => {
+    const plan = RollbackPlanSchema.parse(payload)
+    const db = await deps.ensureWorkspaceDb()
+    const project = db.prepare('SELECT 1 FROM projects WHERE id = ?').get(plan.projectId)
+    if (!project) throw new Error('PROJECT_NOT_FOUND')
+    return applyRollbackPlan(db, plan)
   })
 
   ipcMain.handle('characterarc:export-project-archive', async (_event, payload: unknown) => {

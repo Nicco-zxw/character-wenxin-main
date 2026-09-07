@@ -33,6 +33,14 @@ declare global {
 
   type CharacterArcProjectArchiveImportMode = 'new-project' | 'overwrite-project'
 
+  type NarrativeRollbackPlan = {
+    projectId: string
+    targetChapter: number
+    invalidatedChapters: number[]
+    retainedChapterIds: string[]
+    baseLedgerVersion: number
+  }
+
   type CharacterArcProjectArchivePreview = {
     filePath: string
     archiveVersion: string
@@ -619,6 +627,23 @@ declare global {
         canceled: boolean
         filePath?: string
         error?: string
+      }>
+      truthExportV2: (payload: {
+        projectId: string
+        atChapter: number
+        format: 'json' | 'markdown'
+      }) => Promise<{
+        success: boolean
+        canceled: boolean
+        filePath?: string
+      }>
+      narrativeRollbackPreview: (payload: {
+        projectId: string
+        targetChapter: number
+      }) => Promise<NarrativeRollbackPlan>
+      narrativeRollbackApply: (payload: NarrativeRollbackPlan) => Promise<{
+        ledgerVersion: number
+        invalidatedChapters: number[]
       }>
       inspectProjectArchive: () => Promise<{
         success: boolean
