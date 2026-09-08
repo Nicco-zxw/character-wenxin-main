@@ -1,7 +1,7 @@
 # CharacterArc 本地长篇小说创作平台优化设计
 
 > 日期：2026-09-07  
-> 状态：已评审  
+> 状态：已评审；P1 叙事记忆基础已实现（UI 人工验收待完成）
 > 基础项目：CharacterArc v1.15.5  
 > 参考项目：InkOS v1.7.2 的长篇小说设计模式
 
@@ -299,6 +299,17 @@ AgentProfile 按角色配置 Provider 可用模型、温度、输出预算、推
 - 补齐状态时序语义、伏笔生命周期和任意章点查询。
 - 收紧 Observer–Reducer–Validator–Arbiter 事务边界。
 - 实现 JSON/Markdown 双投影与级联失效回溯。
+
+#### P1 实施记录（2026-09-07）
+
+- 已增加 M0–M4 快照契约、项目级单调账本版本，以及结算记录的基础/提交版本关联。
+- 已将快照、Reducer、章摘要、forecast 失效、账本版本和成功结算记录收口到单个 SQLite 事务；提交前同时校验账本版本、正文哈希、章节归属/顺序与 BOOK-BUSY 租约。
+- 已提供同源 JSON/Markdown 投影、任意章点读取、回溯预览、事务内计划重算、下游逻辑失效和有序重结算队列；章节正文、版本及失效派生行均保留供审计。
+- 已接入 `truth-export-v2`、`narrative-rollback-preview`、`narrative-rollback-apply` IPC，并在写入前执行 Zod 与项目 ID 校验。
+- 叙事迁移已统一为单事务，启动前创建一次性 v4 数据库备份；失败时回滚并以只读模式打开原库，暴露恢复原因与备份路径。
+- 自动验证：新增 pretest 20/20，既有/扩展标准测试 237/237；离线评测维持 133/175 结算、42/42 硬矛盾拦截、伏笔回收 2/3、Observer 故障恢复 3/4。
+- Electron 主进程、preload 和 renderer 生产构建成功；真实旧项目的导出/回溯 UI 操作仍需人工验收。
+- 本批未宣称完成 P2/P3：完整 Task Contract、统一 Context Manifest/transcript 与三轨生产切流仍按后续阶段实施；投影当前按请求即时再生，尚未增加后台缓存目录与自动刷新。
 
 ### P2：上下文与 Reliability 底座
 
